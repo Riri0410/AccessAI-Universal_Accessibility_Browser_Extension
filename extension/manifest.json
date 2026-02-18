@@ -1,0 +1,52 @@
+{
+  "manifest_version": 3,
+  "name": "AccessAI - Universal Accessibility Assistant",
+  "version": "1.0.0",
+  "description": "AI-powered accessibility: Social Cue Coach, Web-Sight Navigator, ClearContext Education Buddy.",
+  "permissions": [
+    "activeTab",
+    "storage",
+    "scripting",
+    "tts"
+  ],
+  "host_permissions": [
+    "https://api.openai.com/*",
+    "https://*/*",
+    "http://*/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    },
+    "default_title": "Toggle AccessAI Sidebar"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://*/*", "http://*/*"],
+      "js": [
+        "content-scripts/sidebar.js",
+        "content-scripts/social-cue.js",
+        "content-scripts/web-sight.js",
+        "content-scripts/clear-context.js"
+      ],
+      "css": ["styles/sidebar.css"],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["styles/*", "icons/*"],
+      "matches": ["<all_urls>"]
+    }
+  ],
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

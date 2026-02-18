@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AccessAI Icon Generator</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #0f172a;
+      color: #e2e8f0;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 2rem;
+    }
+    h1 {
+      font-size: 1.8rem;
+      margin-bottom: 0.5rem;
+      color: #60a5fa;
+    }
+    p.subtitle {
+      color: #94a3b8;
+      margin-bottom: 2rem;
+    }
+    .icons-container {
+      display: flex;
+      gap: 2.5rem;
+      align-items: flex-end;
+      margin-bottom: 2rem;
+    }
+    .icon-card {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 0.75rem;
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 12px;
+      padding: 1.5rem;
+    }
+    .icon-card canvas {
+      border-radius: 4px;
+      image-rendering: pixelated;
+    }
+    .icon-card .label {
+      font-size: 0.85rem;
+      color: #94a3b8;
+    }
+    .icon-card .size {
+      font-size: 0.75rem;
+      color: #64748b;
+    }
+    a.download-btn {
+      display: inline-block;
+      margin-top: 0.25rem;
+      padding: 0.4rem 1rem;
+      background: #60a5fa;
+      color: #0f172a;
+      text-decoration: none;
+      border-radius: 6px;
+      font-size: 0.8rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    a.download-btn:hover {
+      background: #93c5fd;
+    }
+    .download-all-btn {
+      margin-top: 1rem;
+      padding: 0.6rem 2rem;
+      background: #3b82f6;
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      font-size: 1rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    .download-all-btn:hover {
+      background: #60a5fa;
+    }
+    .note {
+      margin-top: 2rem;
+      max-width: 500px;
+      text-align: center;
+      font-size: 0.8rem;
+      color: #64748b;
+      line-height: 1.5;
+    }
+  </style>
+</head>
+<body>
+  <h1>AccessAI Icon Generator</h1>
+  <p class="subtitle">Generate PNG icons for the browser extension</p>
+
+  <div class="icons-container">
+    <div class="icon-card">
+      <canvas id="canvas16" width="16" height="16"></canvas>
+      <span class="label">icon16.png</span>
+      <span class="size">16 x 16</span>
+      <a class="download-btn" id="dl16">Download</a>
+    </div>
+    <div class="icon-card">
+      <canvas id="canvas48" width="48" height="48"></canvas>
+      <span class="label">icon48.png</span>
+      <span class="size">48 x 48</span>
+      <a class="download-btn" id="dl48">Download</a>
+    </div>
+    <div class="icon-card">
+      <canvas id="canvas128" width="128" height="128"></canvas>
+      <span class="label">icon128.png</span>
+      <span class="size">128 x 128</span>
+      <a class="download-btn" id="dl128">Download</a>
+    </div>
+  </div>
+
+  <button class="download-all-btn" id="downloadAll">Download All</button>
+
+  <p class="note">
+    Open this file in a browser, then click the download buttons to save each icon.
+    Place the downloaded PNG files into <code>extension/icons/</code>.
+  </p>
+
+  <script>
+    function drawIcon(canvas, size) {
+      const ctx = canvas.getContext('2d');
+      const cx = size / 2;
+      const cy = size / 2;
+      const r = size / 2;
+
+      // Clear
+      ctx.clearRect(0, 0, size, size);
+
+      // Background circle with gradient
+      const grad = ctx.createRadialGradient(cx * 0.7, cy * 0.7, 0, cx, cy, r);
+      grad.addColorStop(0, '#93c5fd');
+      grad.addColorStop(1, '#3b82f6');
+
+      ctx.beginPath();
+      ctx.arc(cx, cy, r - 0.5, 0, Math.PI * 2);
+      ctx.fillStyle = grad;
+      ctx.fill();
+
+      // Subtle inner shadow / ring
+      if (size >= 48) {
+        ctx.beginPath();
+        ctx.arc(cx, cy, r - 1.5, 0, Math.PI * 2);
+        ctx.strokeStyle = 'rgba(255,255,255,0.15)';
+        ctx.lineWidth = 1;
+        ctx.stroke();
+      }
+
+      // Letter "A"
+      ctx.fillStyle = '#ffffff';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+
+      // Choose font size relative to icon size
+      const fontSize = Math.round(size * 0.55);
+      ctx.font = `bold ${fontSize}px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif`;
+
+      // Slight vertical offset to visually center the "A"
+      ctx.fillText('A', cx, cy + size * 0.03);
+
+      // For larger sizes, add a small accessibility accent (a tiny arc under the A)
+      if (size >= 48) {
+        const accentY = cy + fontSize * 0.42;
+        const accentWidth = size * 0.22;
+        ctx.beginPath();
+        ctx.arc(cx, accentY + size * 0.02, accentWidth, Math.PI * 0.1, Math.PI * 0.9);
+        ctx.strokeStyle = 'rgba(255,255,255,0.7)';
+        ctx.lineWidth = Math.max(1, size * 0.025);
+        ctx.lineCap = 'round';
+        ctx.stroke();
+      }
+    }
+
+    // Render all icons
+    const sizes = [16, 48, 128];
+    const canvases = {};
+
+    sizes.forEach(size => {
+      const canvas = document.getElementById('canvas' + size);
+      drawIcon(canvas, size);
+      canvases[size] = canvas;
+    });
+
+    // Download helpers
+    function downloadCanvas(canvas, filename) {
+      const link = document.createElement('a');
+      link.download = filename;
+      link.href = canvas.toDataURL('image/png');
+      link.click();
+    }
+
+    document.getElementById('dl16').addEventListener('click', () => {
+      downloadCanvas(canvases[16], 'icon16.png');
+    });
+
+    document.getElementById('dl48').addEventListener('click', () => {
+      downloadCanvas(canvases[48], 'icon48.png');
+    });
+
+    document.getElementById('dl128').addEventListener('click', () => {
+      downloadCanvas(canvases[128], 'icon128.png');
+    });
+
+    document.getElementById('downloadAll').addEventListener('click', () => {
+      downloadCanvas(canvases[16], 'icon16.png');
+      setTimeout(() => downloadCanvas(canvases[48], 'icon48.png'), 200);
+      setTimeout(() => downloadCanvas(canvases[128], 'icon128.png'), 400);
+    });
+  </script>
+</body>
+</html>
