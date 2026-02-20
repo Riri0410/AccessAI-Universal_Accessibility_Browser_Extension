@@ -1,69 +1,25 @@
-// ============================================================
-// ClearContext: Live Education Buddy
-// Uses OpenAI Realtime API for continuous two-way voice
-// - Mic streams continuously (always listening to lectures)
-// - AI extracts jargon, responds in AUDIO + TEXT simultaneously
-// - Builds a live concept map and term cards
-// ============================================================
 
 (function () {
   'use strict';
 
-  const SYSTEM_PROMPT = `You are ClearContext, a real-time Academic-to-Plain-English Translator. You help neurodivergent students understand complex lectures by extracting jargon and explaining it simply.
+  const SAMPLE_RATE   = 24000;
+  const BUFFER_SIZE   = 4096;
+  const REALTIME_URL  = 'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17';
 
-You receive a live audio stream from the user's lecture/class. Listen continuously.
-
-RESPONSE RULES:
-- When you hear a technical term, Latin phrase, or complex concept — explain it immediately.
-- Always respond in spoken natural language first (this is what the user hears aloud).
-- After your spoken explanation, append structured data on a new line for the frontend:
-  TERM:{"term":"Mitosis","definition":"How a cell splits to make a copy of itself","parent":"Biology","visual":"cell splitting icon"}
-- You can output multiple TERM blocks if multiple terms come up.
-- Keep spoken responses SHORT (1-2 sentences). The student is listening to a lecture!
-- Use plain English. Grade 5 level. Zero jargon in definitions.
-- Filter out filler words (um, like, basically) from your understanding.
-- Only explain "pivot point" terms that cause confusion. Don't summarize everything.
-- If the student asks you a question, answer it simply and clearly.
-
-CONCEPT MAP:
-- Each TERM has a "parent" field for building a concept map.
-- Common parents: the broader topic the term belongs to.
-
-Be warm and encouraging. You are helping someone who processes information differently.`;
-
-  // ------- State -------
-  let paneEl = null;
-  let termsListEl = null;
-  let mapCanvasEl = null;
-  let transcriptEl = null;
+  let paneEl      = null;
+  let feedEl      = null;
   let initialized = false;
-  let isAgentActive = false;
+  let isActive    = false;
 
-  // WebSocket + Audio
-  let ws = null;
-  let micStream = null;
-  let micContext = null;
-  let micProcessor = null;
-  let apiKey = null;
+  let ws            = null;
+  let micStream     = null;
+  let audioCtx      = null;
+  let processorNode = null;
+  let apiKey        = null;
+  let cardCount     = 0;
+  let currentText   = '';
 
-  // Audio playback for AI voice
-  let playbackContext = null;
-  let nextStartTime = 0;
-
-  // Text streaming
-  let currentAIText = '';
-  let lastTranscriptEl = null;
-
-  // Concept map data
-  let terms = [];
-  let mapNodes = [];
-
-  // Active sub-tab
-  let activeTab = 'terms';
-
-  // ============================================================
-  // INIT PANE
-  // ============================================================
+  // ─── Init pane ────────────────────────────────────────────
   function initPane() {
     if (initialized) return;
     const pane = window.__accessai?.getSidebarPane('clear-context');
@@ -71,572 +27,359 @@ Be warm and encouraging. You are helping someone who processes information diffe
 
     initialized = true;
     paneEl = pane;
+
     paneEl.innerHTML = `
-      <div class="aai-cc-tabs">
-        <button class="aai-cc-tab aai-cc-tab-active" data-tab="terms">Terms</button>
-        <button class="aai-cc-tab" data-tab="map">Concept Map</button>
-        <button class="aai-cc-tab" data-tab="transcript">Live Feed</button>
-      </div>
-
-      <div class="aai-cc-pane aai-cc-pane-active" id="aai-cc-terms-pane">
-        <div class="aai-cc-hero-wrap" id="aai-cc-hero">
-          <div class="aai-start-hero">
-            <button class="aai-start-orb aai-start-orb-cc" id="aai-cc-start-orb" aria-label="Start ClearContext AI">
-              <span class="aai-orb-ring aai-orb-ring-1"></span>
-              <span class="aai-orb-ring aai-orb-ring-2"></span>
-              <span class="aai-orb-ring aai-orb-ring-3"></span>
-              <span class="aai-orb-core">
-                <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/>
-                  <path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/>
-                </svg>
-              </span>
-            </button>
-            <div class="aai-start-label">Start ClearContext</div>
-            <div class="aai-start-sublabel">AI listens to your lecture and explains complex terms in real-time</div>
-          </div>
+      <div class="acc-hero-wrap" id="acc-hero">
+        <div class="aai-start-hero">
+          <button class="aai-start-orb aai-start-orb-cc" id="acc-start-orb" aria-label="Start ClearContext">
+            <span class="aai-orb-ring aai-orb-ring-1"></span>
+            <span class="aai-orb-ring aai-orb-ring-2"></span>
+            <span class="aai-orb-ring aai-orb-ring-3"></span>
+            <span class="aai-orb-core">
+              <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/>
+                <path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/>
+              </svg>
+            </span>
+          </button>
+          <div class="aai-start-label">Start ClearContext</div>
+          <div class="aai-start-sublabel">Listens and shows simple explanations of what's being taught</div>
         </div>
-        <div class="aai-cc-terms-list" id="aai-cc-terms-list" style="display:none;"></div>
       </div>
 
-      <div class="aai-cc-pane" id="aai-cc-map-pane">
-        <canvas id="aai-cc-canvas" width="340" height="300"></canvas>
+      <div class="acc-feed" id="acc-feed" role="log" aria-live="polite" style="display:none;"></div>
+
+      <div class="acc-footer" id="acc-footer" style="display:none;">
+        <button class="acc-clear-btn" id="acc-clear">Clear</button>
       </div>
 
-      <div class="aai-cc-pane" id="aai-cc-transcript-pane">
-        <div id="aai-cc-transcript" class="aai-cc-transcript-feed"></div>
-      </div>
+      <style>
+        .aai-start-orb-cc .aai-orb-core { background: linear-gradient(135deg, #059669, #10b981); }
+        .aai-start-orb-cc .aai-orb-ring-1 { border-color: rgba(16,185,129,0.5); }
+        .aai-start-orb-cc .aai-orb-ring-2 { border-color: rgba(16,185,129,0.3); }
+        .aai-start-orb-cc .aai-orb-ring-3 { border-color: rgba(16,185,129,0.15); }
 
-      <div class="aai-cc-input-row">
-        <input type="text" id="aai-cc-text-input" class="aai-cc-text-field"
-          placeholder="Ask a question..." aria-label="Ask a question" />
-        <button class="aai-cc-send-btn" id="aai-cc-send" aria-label="Send">&#10148;</button>
-      </div>
+        .acc-feed {
+          flex: 1;
+          overflow-y: auto;
+          padding: 10px 14px;
+          display: flex;
+          flex-direction: column;
+          gap: 8px;
+          scrollbar-width: thin;
+          scrollbar-color: rgba(16,185,129,0.3) transparent;
+        }
+        .acc-feed::-webkit-scrollbar { width: 3px; }
+        .acc-feed::-webkit-scrollbar-thumb { background: rgba(16,185,129,0.3); border-radius: 2px; }
+
+        .acc-card {
+          background: rgba(16,185,129,0.06);
+          border: 1px solid rgba(16,185,129,0.18);
+          border-radius: 10px;
+          padding: 10px 13px;
+          animation: acc-pop 0.25s cubic-bezier(0.16,1,0.3,1);
+          flex-shrink: 0;
+        }
+        @keyframes acc-pop {
+          from { opacity: 0; transform: translateY(6px) scale(0.97); }
+          to   { opacity: 1; transform: translateY(0) scale(1); }
+        }
+        .acc-card-text {
+          font-size: 13px;
+          font-weight: 500;
+          color: #e2faf2;
+          line-height: 1.5;
+        }
+        .acc-card-meta {
+          margin-top: 5px;
+          font-size: 9px;
+          color: #374151;
+          font-family: monospace;
+          letter-spacing: 0.04em;
+        }
+
+        .acc-footer {
+          padding: 10px 14px;
+          border-top: 1px solid rgba(255,255,255,0.04);
+          flex-shrink: 0;
+        }
+        .acc-clear-btn {
+          width: 100%;
+          background: transparent;
+          border: 1px solid rgba(255,255,255,0.06);
+          border-radius: 8px;
+          padding: 7px;
+          color: #374151;
+          font-family: monospace;
+          font-size: 10px;
+          letter-spacing: 0.07em;
+          text-transform: uppercase;
+          cursor: pointer;
+          transition: all 0.2s;
+        }
+        .acc-clear-btn:hover {
+          border-color: rgba(239,68,68,0.3);
+          color: #f87171;
+        }
+      </style>
     `;
 
-    termsListEl = document.getElementById('aai-cc-terms-list');
-    mapCanvasEl = document.getElementById('aai-cc-canvas');
-    transcriptEl = document.getElementById('aai-cc-transcript');
-
-    // Tab switching
-    paneEl.querySelectorAll('.aai-cc-tab').forEach(tab => {
-      tab.addEventListener('click', () => switchTab(tab.dataset.tab));
-    });
-
-    // Start button
-    document.getElementById('aai-cc-start-orb').addEventListener('click', toggleAgent);
-
-    // Text input
-    document.getElementById('aai-cc-send').addEventListener('click', handleTextInput);
-    document.getElementById('aai-cc-text-input').addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') handleTextInput();
+    feedEl = document.getElementById('acc-feed');
+    document.getElementById('acc-start-orb').addEventListener('click', toggleAssistant);
+    document.getElementById('acc-clear').addEventListener('click', () => {
+      if (feedEl) feedEl.innerHTML = '';
+      cardCount = 0;
+      window.__accessai?.setFooterStatus('');
     });
   }
 
-  function switchTab(tab) {
-    activeTab = tab;
-    paneEl.querySelectorAll('.aai-cc-tab').forEach(t => t.classList.remove('aai-cc-tab-active'));
-    paneEl.querySelectorAll('.aai-cc-pane').forEach(p => p.classList.remove('aai-cc-pane-active'));
-    paneEl.querySelector(`[data-tab="${tab}"]`).classList.add('aai-cc-tab-active');
+  // ─── Toggle ───────────────────────────────────────────────
+  async function toggleAssistant() { isActive ? stop() : await start(); }
 
-    const paneMap = { terms: 'aai-cc-terms-pane', map: 'aai-cc-map-pane', transcript: 'aai-cc-transcript-pane' };
-    document.getElementById(paneMap[tab]).classList.add('aai-cc-pane-active');
-    if (tab === 'map') drawConceptMap();
-  }
-
-  // ============================================================
-  // AGENT TOGGLE
-  // ============================================================
-  async function toggleAgent() {
-    if (isAgentActive) {
-      stopAgent();
-    } else {
-      await startAgent();
-    }
-  }
-
-  async function startAgent() {
-    const orb = document.getElementById('aai-cc-start-orb');
-    const label = paneEl.querySelector('.aai-start-label');
-
+  // ─── Start ────────────────────────────────────────────────
+  async function start() {
+    const orb   = document.getElementById('acc-start-orb');
+    const label = paneEl?.querySelector('.aai-start-label');
+    const sub   = paneEl?.querySelector('.aai-start-sublabel');
     orb.classList.add('aai-orb-connecting');
-    if (label) label.textContent = 'Connecting...';
+    if (label) label.textContent = 'Connecting…';
 
-    try {
-      // Get API key
-      const keyResp = await sendMessage({ type: 'API_REALTIME_SESSION' });
-      if (!keyResp.success) throw new Error('Could not get API key');
-      apiKey = keyResp.apiKey;
-
-      // Get mic
-      micStream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-          sampleRate: 24000,
-          channelCount: 1
-        }
-      });
-
-      // Audio playback context
-      playbackContext = new AudioContext({ sampleRate: 24000 });
-      nextStartTime = 0;
-
-      // Connect WebSocket
-      await connectWebSocket();
-
-    } catch (err) {
+    // API key
+    const keyResp = await msg({ type: 'API_REALTIME_SESSION' });
+    if (!keyResp?.success) {
       orb.classList.remove('aai-orb-connecting');
       if (label) label.textContent = 'Start ClearContext';
-      addTranscript('error', err.message);
-      stopAgent(false);
+      addCard('⚠ No API key — open extension popup');
+      return;
     }
+    apiKey = keyResp.apiKey;
+
+    // Mic
+    if (label) label.textContent = 'Requesting mic…';
+    try {
+      micStream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, sampleRate: SAMPLE_RATE, channelCount: 1 }
+      });
+    } catch (e) {
+      orb.classList.remove('aai-orb-connecting');
+      if (label) label.textContent = 'Start ClearContext';
+      addCard('⚠ Microphone access denied');
+      return;
+    }
+
+    // WebSocket
+    if (label) label.textContent = 'Connecting to AI…';
+    try { await connectWS(); } catch (e) {
+      cleanup();
+      orb.classList.remove('aai-orb-connecting');
+      if (label) label.textContent = 'Start ClearContext';
+      addCard('⚠ Connection failed — check API key');
+      return;
+    }
+
+    setupAudio();
+
+    isActive = true;
+    orb.classList.remove('aai-orb-connecting');
+    orb.classList.add('aai-orb-active');
+    if (label) label.textContent = 'Listening…';
+    if (sub)   sub.textContent = 'Tap to stop';
+    document.getElementById('acc-hero')?.classList.add('aai-hero-compact');
+    feedEl.style.display = '';
+    document.getElementById('acc-footer').style.display = '';
+    window.__accessai?.setFooterStatus('ClearContext: Listening…');
   }
 
-  function stopAgent(showMsg = true) {
-    isAgentActive = false;
-
-    if (micProcessor) { try { micProcessor.disconnect(); } catch(e){} micProcessor = null; }
-    if (micContext) { try { micContext.close(); } catch(e){} micContext = null; }
-    if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
-    if (ws) { try { ws.close(); } catch(e){} ws = null; }
-    if (playbackContext) { try { playbackContext.close(); } catch(e){} playbackContext = null; }
-
-    currentAIText = '';
-    lastTranscriptEl = null;
-
-    const orb = document.getElementById('aai-cc-start-orb');
+  // ─── Stop ─────────────────────────────────────────────────
+  function stop() {
+    isActive = false;
+    cleanup();
+    const orb   = document.getElementById('acc-start-orb');
     const label = paneEl?.querySelector('.aai-start-label');
-    const hero = document.getElementById('aai-cc-hero');
-
-    if (orb) {
-      orb.classList.remove('aai-orb-connecting', 'aai-orb-active', 'aai-orb-speaking');
-    }
+    const sub   = paneEl?.querySelector('.aai-start-sublabel');
+    orb?.classList.remove('aai-orb-connecting', 'aai-orb-active');
     if (label) label.textContent = 'Start ClearContext';
-    if (hero) hero.style.display = '';
-
+    if (sub)   sub.textContent = 'Listens and shows simple explanations of what\'s being taught';
+    document.getElementById('acc-hero')?.classList.remove('aai-hero-compact');
     window.__accessai?.setFooterStatus('ClearContext stopped');
-    if (showMsg) addTranscript('system', 'ClearContext stopped');
   }
 
-  // ============================================================
-  // WEBSOCKET: OpenAI Realtime API
-  // ============================================================
-  async function connectWebSocket() {
+  function cleanup() {
+    if (ws)            { try { ws.close(); }              catch(e){} ws = null; }
+    if (processorNode) { try { processorNode.disconnect();} catch(e){} processorNode = null; }
+    if (audioCtx)      { try { audioCtx.close(); }        catch(e){} audioCtx = null; }
+    if (micStream)     { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+  }
+
+  // ─── WebSocket ────────────────────────────────────────────
+  function connectWS() {
     return new Promise((resolve, reject) => {
-      const url = 'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17';
+      const timeout = setTimeout(() => { try { ws?.close(); } catch(e){} reject(); }, 12000);
 
-      ws = new WebSocket(url, [
-        'realtime',
-        `openai-insecure-api-key.${apiKey}`,
-        'openai-beta.realtime-v1'
-      ]);
+      ws = new WebSocket(REALTIME_URL,
+        ['realtime', `openai-insecure-api-key.${apiKey}`, 'openai-beta.realtime-v1']
+      );
 
-      ws.onopen = () => {
+      ws.addEventListener('open', () => {
+        clearTimeout(timeout);
         ws.send(JSON.stringify({
           type: 'session.update',
           session: {
-            modalities: ['text', 'audio'],
-            instructions: SYSTEM_PROMPT,
-            voice: 'nova',
+            modalities: ['text'],   // TEXT ONLY — no audio output, no speaking
+            instructions: buildPrompt(),
             input_audio_format: 'pcm16',
-            output_audio_format: 'pcm16',
-            input_audio_transcription: { model: 'whisper-1' },
             turn_detection: {
               type: 'server_vad',
-              threshold: 0.5,
+              threshold: 0.4,
               prefix_padding_ms: 300,
-              silence_duration_ms: 800
+              silence_duration_ms: 1200,  // wait for a full sentence/thought
             },
-            temperature: 0.4,
-            max_response_output_tokens: 400
+            temperature: 0.5,
+            max_response_output_tokens: 60,  // short cards only
           }
         }));
-
-        isAgentActive = true;
-
-        const orb = document.getElementById('aai-cc-start-orb');
-        const label = paneEl?.querySelector('.aai-start-label');
-        const sublabel = paneEl?.querySelector('.aai-start-sublabel');
-
-        if (orb) {
-          orb.classList.remove('aai-orb-connecting');
-          orb.classList.add('aai-orb-active');
-        }
-        if (label) label.textContent = 'Listening...';
-        if (sublabel) sublabel.textContent = 'Tap to stop';
-
-        // Show terms list
-        const termsList = document.getElementById('aai-cc-terms-list');
-        if (termsList) termsList.style.display = '';
-
-        startMicStreaming();
-        addTranscript('system', 'ClearContext connected — listening to lecture');
-        window.__accessai?.setFooterStatus('ClearContext: Listening...');
         resolve();
-      };
+      });
 
-      ws.onmessage = (event) => {
-        try { handleRealtimeEvent(JSON.parse(event.data)); } catch (e) {}
-      };
+      ws.addEventListener('error', () => { clearTimeout(timeout); reject(); });
+      ws.addEventListener('message', handleWS);
 
-      ws.onerror = () => reject(new Error('WebSocket failed'));
-
-      ws.onclose = () => {
-        if (isAgentActive) {
-          addTranscript('system', 'Reconnecting...');
-          setTimeout(async () => {
-            if (isAgentActive) {
-              try { await connectWebSocket(); }
-              catch (err) { stopAgent(); }
-            }
-          }, 2000);
-        }
-      };
+      // Reconnect on unexpected close (don't kill the session)
+      ws.addEventListener('close', () => {
+        if (!isActive) return;
+        setTimeout(async () => {
+          if (!isActive) return;
+          try {
+            await connectWS();
+            rebuildAudio();
+          } catch(e) { stop(); }
+        }, 2000);
+      });
     });
   }
 
-  // ============================================================
-  // MIC STREAMING
-  // ============================================================
-  function startMicStreaming() {
-    micContext = new AudioContext({ sampleRate: 24000 });
-    const source = micContext.createMediaStreamSource(micStream);
-    micProcessor = micContext.createScriptProcessor(2048, 1, 1);
+  function buildPrompt() {
+    return `You are ClearContext, a silent educational assistant.
 
-    micProcessor.onaudioprocess = (e) => {
-      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+You listen to a lecture, class, meeting, or video lesson through the microphone.
 
-      const float32 = e.inputBuffer.getChannelData(0);
-      const int16 = new Int16Array(float32.length);
-      for (let i = 0; i < float32.length; i++) {
-        const s = Math.max(-1, Math.min(1, float32[i]));
-        int16[i] = s < 0 ? s * 32768 : s * 32767;
-      }
+YOUR ONLY JOB:
+When you hear a concept, topic, term, or explanation being taught, output ONE short simplified phrase (max 20 words, plain simple English, grade 5 reading level) that captures the key idea in the simplest possible way.
 
-      const bytes = new Uint8Array(int16.buffer);
-      let binary = '';
-      for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
-      const b64 = btoa(binary);
+FORMAT: Just the plain phrase. No bullet points. No labels. No markdown. No quotes.
 
-      ws.send(JSON.stringify({
-        type: 'input_audio_buffer.append',
-        audio: b64
-      }));
-    };
+RULES:
+- Max 20 words. Hard limit.
+- Plain everyday English only. No jargon.
+- One phrase per topic/concept heard.
+- If the speaker is just saying filler words, chatting casually, or nothing educational is happening — output exactly: SKIP
+- Never speak. Never ask questions. Only output simplified phrases or SKIP.
 
-    source.connect(micProcessor);
-    micProcessor.connect(micContext.destination);
+GOOD EXAMPLES (for what you'd hear in class):
+"Photosynthesis is how plants turn sunlight into food they can use to grow."
+"A function is a reusable block of code that does one specific job."
+"Supply and demand means prices go up when something is rare and wanted."
+"The mitochondria makes energy the cell needs to stay alive and work."
+
+Output SKIP for filler, greetings, off-topic chat, or silence.`;
   }
 
-  // ============================================================
-  // HANDLE REALTIME EVENTS
-  // ============================================================
-  function handleRealtimeEvent(event) {
-    switch (event.type) {
+  // ─── WS message handler ───────────────────────────────────
+  function handleWS(event) {
+    let data; try { data = JSON.parse(event.data); } catch { return; }
 
-      case 'input_audio_buffer.speech_started': {
-        const orb = document.getElementById('aai-cc-start-orb');
-        if (orb) orb.classList.add('aai-orb-speaking');
-        stopAudioPlayback();
-        break;
-      }
-
-      case 'input_audio_buffer.speech_stopped': {
-        const orb = document.getElementById('aai-cc-start-orb');
-        if (orb) orb.classList.remove('aai-orb-speaking');
-        break;
-      }
-
-      case 'conversation.item.input_audio_transcription.completed':
-        if (event.transcript?.trim()) {
-          addTranscript('user', event.transcript.trim());
-        }
-        break;
-
+    switch (data.type) {
       case 'response.text.delta':
-        appendAITextDelta(event.delta || '');
+        currentText += data.delta || '';
         break;
 
       case 'response.text.done':
-        finalizeAIText(event.text || currentAIText);
+      case 'response.done': {
+        const text = currentText.trim();
+        currentText = '';
+        if (!text || text === 'SKIP' || text.toUpperCase() === 'SKIP') break;
+        // Extra guard: skip if AI accidentally output "SKIP" in a sentence
+        if (text.length < 4) break;
+        addCard(text);
+        break;
+      }
+
+      case 'input_audio_buffer.speech_started':
+        window.__accessai?.setFooterStatus('ClearContext: Listening…');
+        document.getElementById('acc-start-orb')?.classList.add('aai-orb-speaking');
         break;
 
-      case 'response.audio.delta':
-        if (event.delta) scheduleAudioChunk(event.delta);
-        break;
-
-      case 'response.done':
-        window.__accessai?.setFooterStatus('ClearContext: Listening...');
+      case 'input_audio_buffer.speech_stopped':
+        document.getElementById('acc-start-orb')?.classList.remove('aai-orb-speaking');
         break;
 
       case 'error':
-        addTranscript('error', event.error?.message || 'API error');
+        // Non-fatal — just log to console, don't show to user
+        console.warn('[ClearContext] API error:', data.error?.code || data.error?.message);
         break;
     }
   }
 
-  // ============================================================
-  // AI AUDIO PLAYBACK
-  // ============================================================
-  function scheduleAudioChunk(base64Audio) {
-    if (!playbackContext) return;
-
-    const binary = atob(base64Audio);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-
-    const int16 = new Int16Array(bytes.buffer);
-    const float32 = new Float32Array(int16.length);
-    for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 32768.0;
-
-    const audioBuffer = playbackContext.createBuffer(1, float32.length, 24000);
-    audioBuffer.getChannelData(0).set(float32);
-
-    const source = playbackContext.createBufferSource();
-    source.buffer = audioBuffer;
-    source.connect(playbackContext.destination);
-
-    const startAt = Math.max(playbackContext.currentTime, nextStartTime);
-    source.start(startAt);
-    nextStartTime = startAt + audioBuffer.duration;
+  // ─── Audio pipeline ───────────────────────────────────────
+  function setupAudio() {
+    audioCtx = new AudioContext({ sampleRate: SAMPLE_RATE });
+    const source = audioCtx.createMediaStreamSource(micStream);
+    processorNode = audioCtx.createScriptProcessor(BUFFER_SIZE, 1, 1);
+    processorNode.onaudioprocess = (e) => {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      const f32 = e.inputBuffer.getChannelData(0);
+      const pcm = new Int16Array(f32.length);
+      for (let i = 0; i < f32.length; i++) {
+        const s = Math.max(-1, Math.min(1, f32[i]));
+        pcm[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+      }
+      const bytes = new Uint8Array(pcm.buffer); let bin = '';
+      for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+      ws.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: btoa(bin) }));
+    };
+    source.connect(processorNode);
+    processorNode.connect(audioCtx.destination);
   }
 
-  function stopAudioPlayback() {
-    if (playbackContext) nextStartTime = playbackContext.currentTime;
+  function rebuildAudio() {
+    if (processorNode) { try { processorNode.disconnect(); } catch(e){} processorNode = null; }
+    if (audioCtx)      { try { audioCtx.close(); }          catch(e){} audioCtx = null; }
+    if (micStream) setupAudio();
   }
 
-  // ============================================================
-  // AI TEXT STREAMING
-  // ============================================================
-  function appendAITextDelta(delta) {
-    if (!lastTranscriptEl || !lastTranscriptEl.classList.contains('aai-cc-ai-streaming')) {
-      currentAIText = '';
-      lastTranscriptEl = document.createElement('div');
-      lastTranscriptEl.className = 'aai-cc-ai-msg aai-cc-ai-streaming';
-      lastTranscriptEl.innerHTML = '<span class="aai-cc-ai-label">ClearContext</span><span class="aai-cc-ai-text"></span>';
-      transcriptEl.appendChild(lastTranscriptEl);
-    }
-
-    currentAIText += delta;
-    const displayText = currentAIText.replace(/TERM:\{[\s\S]*?\}/g, '').trim();
-    const textSpan = lastTranscriptEl.querySelector('.aai-cc-ai-text');
-    if (textSpan) textSpan.textContent = displayText;
-    transcriptEl.scrollTop = transcriptEl.scrollHeight;
-  }
-
-  function finalizeAIText(fullText) {
-    const text = fullText || currentAIText;
-
-    if (lastTranscriptEl) {
-      lastTranscriptEl.classList.remove('aai-cc-ai-streaming');
-      const displayText = text.replace(/TERM:\{[\s\S]*?\}/g, '').trim();
-      const textSpan = lastTranscriptEl.querySelector('.aai-cc-ai-text');
-      if (textSpan) textSpan.textContent = displayText;
-      lastTranscriptEl = null;
-    }
-
-    currentAIText = '';
-
-    // Extract TERM blocks
-    const termMatches = text.matchAll(/TERM:(\{[\s\S]*?\})/g);
-    for (const match of termMatches) {
-      try {
-        const termData = JSON.parse(match[1]);
-        addTermCard(termData);
-      } catch (e) {}
-    }
-  }
-
-  // ============================================================
-  // TERM CARDS & CONCEPT MAP
-  // ============================================================
-  function addTermCard(data) {
-    if (!termsListEl) return;
-    terms.push(data);
+  // ─── Render card ──────────────────────────────────────────
+  function addCard(text) {
+    if (!feedEl) return;
+    cardCount++;
+    const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 
     const card = document.createElement('div');
-    card.className = 'aai-cc-term-card';
-    card.setAttribute('role', 'article');
+    card.className = 'acc-card';
     card.innerHTML = `
-      <div class="aai-cc-term-name">${escHtml(data.term)}</div>
-      <div class="aai-cc-term-def">${escHtml(data.definition)}</div>
-      <div class="aai-cc-term-meta">
-        ${data.parent ? `<span class="aai-cc-term-parent">${escHtml(data.parent)}</span>` : ''}
-        ${data.visual ? `<span class="aai-cc-term-visual">${escHtml(data.visual)}</span>` : ''}
-      </div>
+      <div class="acc-card-text">${escHtml(text)}</div>
+      <div class="acc-card-meta">${time}</div>
     `;
+    feedEl.appendChild(card);
+    feedEl.scrollTop = feedEl.scrollHeight;
 
-    card.addEventListener('click', () => {
-      sendMessage({ type: 'TTS_SPEAK', text: `${data.term}: ${data.definition}`, rate: 0.9, volume: 0.7 });
-    });
+    // Cap at 60 cards
+    while (feedEl.children.length > 60) feedEl.removeChild(feedEl.firstChild);
 
-    termsListEl.prepend(card);
-
-    addMapNode(data);
-    if (activeTab === 'map') drawConceptMap();
+    window.__accessai?.setFooterStatus(`${cardCount} concept${cardCount !== 1 ? 's' : ''} captured`);
   }
 
-  function addMapNode(data) {
-    const existing = mapNodes.find(n => n.term === data.term);
-    if (existing) return;
+  // ─── Helpers ──────────────────────────────────────────────
+  function escHtml(t) { const d = document.createElement('div'); d.textContent = t; return d.innerHTML; }
+  function msg(m) { return new Promise(r => chrome.runtime.sendMessage(m, r)); }
 
-    const angle = Math.random() * Math.PI * 2;
-    const radius = 60 + Math.random() * 60;
-    mapNodes.push({
-      term: data.term,
-      parent: data.parent || '',
-      x: 170 + Math.cos(angle) * radius,
-      y: 150 + Math.sin(angle) * radius,
-      color: getTermColor(data.parent || '')
-    });
-  }
-
-  function getTermColor(parent) {
-    const colors = ['#f59e0b', '#60a5fa', '#a78bfa', '#34d399', '#f87171', '#fb923c', '#818cf8'];
-    let hash = 0;
-    for (let i = 0; i < parent.length; i++) hash = parent.charCodeAt(i) + ((hash << 5) - hash);
-    return colors[Math.abs(hash) % colors.length];
-  }
-
-  function drawConceptMap() {
-    if (!mapCanvasEl) return;
-    const ctx = mapCanvasEl.getContext('2d');
-    const w = mapCanvasEl.width;
-    const h = mapCanvasEl.height;
-    ctx.clearRect(0, 0, w, h);
-
-    if (mapNodes.length === 0) {
-      ctx.fillStyle = '#52525b';
-      ctx.font = '13px Inter, system-ui, sans-serif';
-      ctx.textAlign = 'center';
-      ctx.fillText('Concept map builds as terms are detected', w / 2, h / 2);
-      return;
-    }
-
-    // Draw connections
-    ctx.strokeStyle = 'rgba(255, 255, 255, 0.08)';
-    ctx.lineWidth = 1;
-    mapNodes.forEach(node => {
-      if (!node.parent) return;
-      const parentNode = mapNodes.find(n => n.term.toLowerCase() === node.parent.toLowerCase());
-      if (parentNode) {
-        ctx.beginPath();
-        ctx.moveTo(node.x, node.y);
-        ctx.lineTo(parentNode.x, parentNode.y);
-        ctx.stroke();
-      }
-    });
-
-    // Draw nodes
-    mapNodes.forEach(node => {
-      ctx.shadowColor = node.color;
-      ctx.shadowBlur = 12;
-      ctx.fillStyle = node.color;
-      ctx.beginPath();
-      ctx.arc(node.x, node.y, 6, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.shadowBlur = 0;
-
-      ctx.fillStyle = '#d4d4d8';
-      ctx.font = '11px Inter, system-ui, sans-serif';
-      ctx.textAlign = 'center';
-      ctx.fillText(node.term, node.x, node.y - 12);
-    });
-  }
-
-  // ============================================================
-  // TEXT INPUT
-  // ============================================================
-  function handleTextInput() {
-    const input = document.getElementById('aai-cc-text-input');
-    const text = input.value.trim();
-    if (!text) return;
-    input.value = '';
-
-    addTranscript('user', text);
-
-    if (!isAgentActive || !ws || ws.readyState !== WebSocket.OPEN) {
-      processTextFallback(text);
-      return;
-    }
-
-    ws.send(JSON.stringify({
-      type: 'conversation.item.create',
-      item: {
-        type: 'message',
-        role: 'user',
-        content: [{ type: 'input_text', text: `[STUDENT QUESTION]: ${text}` }]
-      }
-    }));
-    ws.send(JSON.stringify({ type: 'response.create' }));
-  }
-
-  async function processTextFallback(text) {
-    try {
-      const resp = await sendMessage({
-        type: 'API_REQUEST', model: 'gpt-4o',
-        messages: [
-          { role: 'system', content: SYSTEM_PROMPT },
-          { role: 'user', content: text }
-        ],
-        max_tokens: 300, temperature: 0.4
-      });
-      if (!resp.success) throw new Error(resp.error);
-      const reply = resp.data.choices?.[0]?.message?.content || '';
-      addTranscript('ai', reply.replace(/TERM:\{[\s\S]*?\}/g, '').trim());
-      sendMessage({ type: 'TTS_SPEAK', text: reply.replace(/TERM:\{[\s\S]*?\}/g, '').trim(), rate: 0.9, volume: 0.7 });
-
-      const termMatches = reply.matchAll(/TERM:(\{[\s\S]*?\})/g);
-      for (const match of termMatches) {
-        try { addTermCard(JSON.parse(match[1])); } catch(e) {}
-      }
-    } catch (err) {
-      addTranscript('error', err.message);
-    }
-  }
-
-  // ============================================================
-  // TRANSCRIPT FEED
-  // ============================================================
-  function addTranscript(type, text) {
-    if (!transcriptEl) return;
-    const el = document.createElement('div');
-    el.className = `aai-cc-transcript-line aai-cc-transcript-${type}`;
-    const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-    el.innerHTML = `<span class="aai-cc-time">${time}</span>${escHtml(text)}`;
-    transcriptEl.appendChild(el);
-    transcriptEl.scrollTop = transcriptEl.scrollHeight;
-    while (transcriptEl.children.length > 100) transcriptEl.removeChild(transcriptEl.firstChild);
-  }
-
-  // ============================================================
-  // HELPERS
-  // ============================================================
-  function escHtml(t) {
-    const d = document.createElement('div');
-    d.textContent = t;
-    return d.innerHTML;
-  }
-
-  function sendMessage(msg) {
-    return new Promise(resolve => chrome.runtime.sendMessage(msg, resolve));
-  }
-
-  // ============================================================
-  // LIFECYCLE
-  // ============================================================
+  // ─── Lifecycle ────────────────────────────────────────────
   window.addEventListener('accessai-mode-changed', (e) => {
-    if (e.detail.mode === 'clear-context') {
-      initPane();
-    } else {
-      if (isAgentActive) stopAgent();
-    }
+    if (e.detail.mode === 'clear-context') initPane();
+    else if (isActive) stop();
   });
 
-  chrome.storage.local.get('activeMode', (result) => {
-    if (result.activeMode === 'clear-context') setTimeout(initPane, 500);
+  chrome.storage.local.get('activeMode', (r) => {
+    if (r.activeMode === 'clear-context') setTimeout(initPane, 500);
   });
 
 })();

@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "AccessAI - Universal Accessibility Assistant",
-  "version": "1.0.0",
-  "description": "AI-powered accessibility: Social Cue Coach, Web-Sight Navigator, ClearContext Education Buddy.",
+  "version": "2.0.0",
+  "description": "AI-powered accessibility: Social Cue Coach (v2 with vision), Web-Sight Navigator, ClearContext Education Buddy.",
   "permissions": [
     "activeTab",
     "storage",
