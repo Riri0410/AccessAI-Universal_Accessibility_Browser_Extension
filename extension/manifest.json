@@ -5,6 +5,7 @@
   "description": "AI-powered accessibility: Social Cue Coach (v2 with vision), Web-Sight Navigator, ClearContext Education Buddy.",
   "permissions": [
     "activeTab",
+    "tabs",
     "storage",
     "scripting",
     "tts"
