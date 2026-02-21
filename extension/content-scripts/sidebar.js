@@ -75,17 +75,56 @@
     }
   }
 
-  // For non-Meet pages, push with margin-right on <html>
+  // For non-Meet pages, push layout to the left to make room for the sidebar.
+  // We inject a <style> tag rather than relying on inline margin-right so that
+  // site-specific layout containers (YouTube, complex SPAs) also reflow.
+  let pushStyleEl = null;
+
   function pushGenericLayout(open) {
     if (IS_MEET) return;
-    const el = document.documentElement;
-    if (open) {
-      el.style.marginRight = SIDEBAR_WIDTH + 'px';
-      el.style.transition = 'margin-right 0.35s cubic-bezier(0.4, 0, 0.2, 1)';
-      el.style.overflow = 'auto';
-    } else {
-      el.style.marginRight = '0px';
-    }
+
+    // Remove any existing push style
+    if (pushStyleEl) { pushStyleEl.remove(); pushStyleEl = null; }
+    // Reset inline styles
+    document.documentElement.style.removeProperty('margin-right');
+    document.documentElement.style.removeProperty('transition');
+
+    if (!open) return;
+
+    pushStyleEl = document.createElement('style');
+    pushStyleEl.id = 'accessai-push-layout';
+    pushStyleEl.textContent = `
+      /* ── Generic push: shrink everything to the left of the sidebar ── */
+      html {
+        margin-right: ${SIDEBAR_WIDTH}px !important;
+        max-width: calc(100% - ${SIDEBAR_WIDTH}px) !important;
+        overflow-x: hidden !important;
+        transition: margin-right 0.35s cubic-bezier(0.4,0,0.2,1) !important;
+      }
+
+      /* ── YouTube specific ── */
+      ytd-app,
+      ytd-page-manager,
+      #page-manager,
+      #masthead-container,
+      #masthead {
+        max-width: calc(100vw - ${SIDEBAR_WIDTH}px) !important;
+      }
+
+      /* ── Keep any full-viewport-width overlays/modals inside the pushed area ── */
+      [style*="width: 100vw"],
+      [style*="width:100vw"] {
+        width: calc(100vw - ${SIDEBAR_WIDTH}px) !important;
+      }
+
+      /* ── Don't shift the AccessAI sidebar itself ── */
+      #accessai-sidebar,
+      #accessai-ws-hover-overlay {
+        margin-right: 0 !important;
+        max-width: none !important;
+      }
+    `;
+    document.head.appendChild(pushStyleEl);
   }
 
   // ─── Build sidebar shell ──────────────────────────────────
@@ -236,6 +275,14 @@
     }
     if (message.type === 'MODE_CHANGED' && message.mode && isOpen) {
       selectMode(message.mode);
+    }
+    if (message.type === 'PING') {
+      sendResponse({ alive: true, sidebarOpen: isOpen });
+    }
+    if (message.type === 'RESTORE_STATE') {
+      if (!isOpen) openSidebar();
+      if (message.mode) selectMode(message.mode);
+      sendResponse({ success: true });
     }
   });
 
