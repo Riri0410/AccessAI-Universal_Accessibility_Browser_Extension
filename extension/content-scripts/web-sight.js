@@ -1,81 +1,152 @@
 // ============================================================
-// Web-Sight: Agentic Accessibility Assistant v2
+// Web-Sight: Agentic Accessibility Assistant v3
 //
-// Key change from v1:
-//   Conversation history is persisted to chrome.storage.local
-//   before any navigation. On init, history is restored so the
-//   user sees their full session even after the page reloads.
+// Production-quality hands-free AI browser agent.
 //
-// Architecture:
-//   - OpenAI Realtime API  → mic streaming, voice transcription, TTS
-//   - GPT-4o + function calling → multi-step agentic browser control
-//   - chrome.storage.local → survives page navigations
+// Key improvements in v3:
+//   - Auto-reconnects mic after page navigation
+//   - Forces English-only transcription
+//   - Better element resolution with scoring
+//   - History cleared on Chrome restart (handled by background.js)
+//   - Robust error handling and reconnection
+//   - Extension stays open and mic stays active across navigations
 // ============================================================
 
 (function () {
   'use strict';
 
+  // Guard against double-initialization
+  if (window.__websight_initialized) return;
+  window.__websight_initialized = true;
+
   const SYSTEM_PROMPT = `You are Web-Sight, a hands-free AI browser agent for people with accessibility needs.
 
+You are smart and contextually aware. You think about the website you are on and what it calls things before acting.
+
 When the user gives a command, use your tools to complete it step by step.
-- You receive the current page URL, title, headings, and all interactive elements with selectors.
-- Use find_elements to discover what's on the page when you need to locate something.
-- Use click_element, type_text, press_key in sequence to interact with forms and buttons.
-- Use get_page_context after actions to see what the page now shows.
-- Give a SHORT spoken reply when done (1-2 sentences, plain English, grade 5 level).
-- If uncertain, prefer find_elements first then click.
 
-SAFETY: If the user's command involves "buy", "checkout", "purchase", or "pay" — do NOT proceed. Instead reply asking them to say "confirm" first.`;
+GENERAL RULES:
+- Use get_page_context first to understand the current page structure, labels, and navigation.
+- Give a SHORT reply when done (1-2 sentences, plain English, grade 5 level).
+- Always respond in English only.
 
-  // ─── Conversation history key in chrome.storage ───────────
+═══ SEMANTIC SEARCH INTELLIGENCE — CRITICAL ═══
+NEVER type the user's literal spoken words into a search box on specialised websites.
+Websites use their OWN terminology which may differ completely from how users phrase things.
+
+BEFORE searching on any website:
+1. Call read_page to scan the navigation, headings, and category names on the current page.
+2. Identify what the website CALLS what the user is looking for.
+   EXAMPLE: User says "show me business courses" on a university site.
+     → Read the page. Navigation shows: "Business & Management", "Accounting", "Economics".
+     → Search for "Business Management" NOT "business courses".
+   EXAMPLE: User says "find shoes" on a clothing retailer.
+     → Page has category "Footwear" in nav.
+     → Click "Footwear" or search "footwear" NOT "shoes".
+   EXAMPLE: User says "computer science degree".
+     → University nav shows "Informatics" or "Computing Science".
+     → Use the site's actual label.
+3. If there is a dedicated section/link in the navigation for what the user wants, CLICK it instead of searching.
+4. Only type into search if no direct nav link exists — and use the site's vocabulary, not the user's.
+
+SEARCH REWRITE PROCESS (mandatory for educational/institutional sites):
+- Read page → identify headings/nav items → infer correct terminology → search with that term
+- Log your reasoning in the "action" messages so the user understands what you did
+
+═══════════════════════════════════════════════
+
+ORDINAL ELEMENT SELECTION — CRITICAL:
+When the user says "1st", "first", "2nd", "second", "3rd", "third", etc.:
+  - "1st" or "first" = element at index [0] in the page context list
+  - "2nd" or "second" = element at index [1]
+  - "3rd" or "third"  = element at index [2]
+  - "4th" or "fourth" = element at index [3]
+Count ONLY from the TOP of the interactive elements list.
+Use the EXACT selector shown next to that index number. Do NOT pick by name or relevance.
+EXAMPLE: "click the 3rd link" → find element [2] in the list → use its exact selector.
+
+TYPING RULES — VERY IMPORTANT:
+- To type in ANY input: ALWAYS click_element on the input FIRST (to focus it), THEN call type_text.
+- For Google search: click the search box (aria-label="Search" or name="q") first, then type_text.
+- Always pass the EXACT CSS selector from page context to both click_element and type_text.
+- Never call type_text without clicking first.
+
+NAVIGATION-FIRST WORKFLOW (for "find", "show", "search" commands):
+1. read_page (scan nav + headings to understand site vocabulary)
+2. IF a relevant nav link/section exists → click_element on it directly
+3. IF no direct link → find_elements("search input") → click → type using SITE terminology → press Enter
+
+SAFETY: If the command involves "buy", "checkout", "purchase", or "pay" — stop and ask the user to say "confirm" first.`;
+
+  // ─── Constants ──────────────────────────────────────────────
   const HISTORY_STORAGE_KEY = 'websight_conversation_history';
-  const MAX_STORED_MESSAGES = 40; // cap so storage doesn't bloat
+  const MAX_STORED_MESSAGES = 40;
+  const MAX_AGENT_STEPS = 18;
+  const MAX_RECONNECT_ATTEMPTS = 5;
+  const RECONNECT_BASE_DELAY = 2000;
 
   // ─── State ────────────────────────────────────────────────
-  let paneEl       = null;
-  let outputEl     = null;
-  let hoverOverlay = null;
-  let initialized  = false;
-  let isAgentActive = false;
-  let isTaskRunning = false;
+  let paneEl         = null;
+  let outputEl       = null;
+  let hoverOverlay   = null;
+  let initialized    = false;
+  let isAgentActive  = false;
+  let isTaskRunning  = false;
   let pendingConfirm = null;
+  let reconnectAttempts = 0;
 
   // In-memory conversation history (synced to/from storage)
-  // Each entry: { role: 'user'|'assistant', type: 'command'|'response'|'action'|..., text: string, time: string }
   let conversationHistory = [];
 
   // Realtime WebSocket + Audio
-  let ws           = null;
-  let micStream    = null;
-  let micContext   = null;
-  let micProcessor = null;
-  let apiKey       = null;
-
+  let ws             = null;
+  let micStream      = null;
+  let micContext      = null;
+  let micProcessor    = null;
+  let apiKey          = null;
   let playbackContext = null;
   let nextStartTime   = 0;
 
+  // Flag to auto-reconnect after navigation
+  let shouldAutoReconnect = false;
+
   // ─── Persist / restore history ────────────────────────────
   function saveHistory() {
-    const toSave = conversationHistory.slice(-MAX_STORED_MESSAGES);
-    chrome.storage.local.set({ [HISTORY_STORAGE_KEY]: toSave });
+    try {
+      const toSave = conversationHistory.slice(-MAX_STORED_MESSAGES);
+      chrome.storage.local.set({ [HISTORY_STORAGE_KEY]: toSave });
+    } catch (e) {
+      // Storage might be unavailable during navigation
+    }
   }
 
   function loadHistory() {
     return new Promise(resolve => {
-      chrome.storage.local.get(HISTORY_STORAGE_KEY, (result) => {
-        conversationHistory = result[HISTORY_STORAGE_KEY] || [];
-        resolve(conversationHistory);
-      });
+      try {
+        chrome.storage.local.get(HISTORY_STORAGE_KEY, (result) => {
+          if (chrome.runtime.lastError) {
+            conversationHistory = [];
+            resolve([]);
+            return;
+          }
+          conversationHistory = result[HISTORY_STORAGE_KEY] || [];
+          resolve(conversationHistory);
+        });
+      } catch (e) {
+        conversationHistory = [];
+        resolve([]);
+      }
     });
   }
 
   function clearHistory() {
     conversationHistory = [];
-    chrome.storage.local.remove(HISTORY_STORAGE_KEY);
+    try {
+      chrome.storage.local.remove(HISTORY_STORAGE_KEY);
+    } catch (e) {}
   }
 
   // Rebuild GPT-4o message array from conversation history
-  // (used so the model has context of previous exchanges)
   function buildGPTHistory() {
     const msgs = [];
     for (const entry of conversationHistory) {
@@ -84,7 +155,6 @@ SAFETY: If the user's command involves "buy", "checkout", "purchase", or "pay" �
       } else if (entry.role === 'assistant' && entry.type === 'response') {
         msgs.push({ role: 'assistant', content: entry.text });
       }
-      // action/info/system messages are UI-only, not sent to GPT
     }
     // Keep last 10 exchanges to avoid token bloat
     return msgs.slice(-20);
@@ -92,87 +162,122 @@ SAFETY: If the user's command involves "buy", "checkout", "purchase", or "pay" �
 
   // ─── Tool definitions ─────────────────────────────────────
   const BROWSER_TOOLS = [
-    { type: 'function', function: { name: 'get_page_context', description: 'Get the current page URL, title, headings, and all interactive elements.', parameters: { type: 'object', properties: {} } } },
-    { type: 'function', function: { name: 'find_elements', description: 'Search for elements on the page matching a natural language description.', parameters: { type: 'object', properties: { description: { type: 'string' } }, required: ['description'] } } },
-    { type: 'function', function: { name: 'click_element', description: 'Click an element.', parameters: { type: 'object', properties: { selector: { type: 'string' }, description: { type: 'string' } }, required: ['selector', 'description'] } } },
-    { type: 'function', function: { name: 'type_text', description: 'Type text into an input field.', parameters: { type: 'object', properties: { selector: { type: 'string' }, text: { type: 'string' }, clear_first: { type: 'boolean' } }, required: ['text'] } } },
-    { type: 'function', function: { name: 'press_key', description: 'Press a keyboard key on the focused element.', parameters: { type: 'object', properties: { key: { type: 'string' }, selector: { type: 'string' } }, required: ['key'] } } },
-    { type: 'function', function: { name: 'scroll_page', description: 'Scroll the page.', parameters: { type: 'object', properties: { direction: { type: 'string', enum: ['up', 'down', 'top', 'bottom'] }, amount: { type: 'number' } }, required: ['direction'] } } },
-    { type: 'function', function: { name: 'navigate_to', description: 'Navigate the browser to a URL or website.', parameters: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] } } },
-    { type: 'function', function: { name: 'read_page', description: 'Read the visible text content of the page or a specific section.', parameters: { type: 'object', properties: { selector: { type: 'string' } } } } },
-    { type: 'function', function: { name: 'select_option', description: 'Select a value from a <select> dropdown.', parameters: { type: 'object', properties: { selector: { type: 'string' }, value: { type: 'string' } }, required: ['selector', 'value'] } } }
+    { type: 'function', function: { name: 'get_page_context', description: 'Get the current page URL, title, headings, and all interactive elements with their index numbers.', parameters: { type: 'object', properties: {} } } },
+    { type: 'function', function: { name: 'find_elements', description: 'Search for elements on the page matching a natural language description. Returns elements with selectors you can use to click or interact.', parameters: { type: 'object', properties: { description: { type: 'string', description: 'What to search for, e.g. "add to cart button" or "search input"' } }, required: ['description'] } } },
+    { type: 'function', function: { name: 'click_element', description: 'Click an element by its CSS selector or description.', parameters: { type: 'object', properties: { selector: { type: 'string', description: 'CSS selector, XPath, or element description' }, description: { type: 'string', description: 'Human-readable description of what is being clicked' } }, required: ['selector', 'description'] } } },
+    { type: 'function', function: { name: 'type_text', description: 'Type text into an input field.', parameters: { type: 'object', properties: { selector: { type: 'string', description: 'CSS selector of the input field' }, text: { type: 'string', description: 'Text to type' }, clear_first: { type: 'boolean', description: 'Whether to clear the field first (default true)' } }, required: ['text'] } } },
+    { type: 'function', function: { name: 'press_key', description: 'Press a keyboard key.', parameters: { type: 'object', properties: { key: { type: 'string', description: 'Key to press: Enter, Escape, Tab, Space, Backspace, ArrowDown, ArrowUp' }, selector: { type: 'string', description: 'Optional CSS selector to focus first' } }, required: ['key'] } } },
+    { type: 'function', function: { name: 'scroll_page', description: 'Scroll the page in a direction.', parameters: { type: 'object', properties: { direction: { type: 'string', enum: ['up', 'down', 'top', 'bottom'] }, amount: { type: 'number', description: 'Pixels to scroll (default 500)' } }, required: ['direction'] } } },
+    { type: 'function', function: { name: 'navigate_to', description: 'Navigate the browser to a URL.', parameters: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] } } },
+    { type: 'function', function: { name: 'read_page', description: 'Read the visible text content of the page.', parameters: { type: 'object', properties: { selector: { type: 'string', description: 'Optional CSS selector to read from' } } } } },
+    { type: 'function', function: { name: 'select_option', description: 'Select a value from a dropdown.', parameters: { type: 'object', properties: { selector: { type: 'string' }, value: { type: 'string' } }, required: ['selector', 'value'] } } },
   ];
 
   // ─── Agentic task runner ──────────────────────────────────
   async function runAgentTask(command) {
-    if (isTaskRunning) { addMsg('warning', 'Still working on a previous task — please wait.'); return; }
+    if (isTaskRunning) {
+      addMsg('warning', 'Still working on a previous task. Please wait.');
+      return;
+    }
 
     const buyWords = ['buy ', 'purchase', 'checkout', 'pay ', 'place order', 'order now'];
     if (buyWords.some(w => command.toLowerCase().includes(w))) {
       pendingConfirm = command;
-      addMsg('confirm', `Safety: "${command.slice(0, 60)}" — say "confirm" to proceed, or say something else to cancel.`);
+      addMsg('confirm', `Safety check: "${command.slice(0, 60)}" - say "confirm" to proceed, or say something else to cancel.`);
       return;
     }
 
     isTaskRunning = true;
     setOrbState('thinking');
 
-    // Build messages: system + previous conversation context + current command + page context
     const messages = [
       { role: 'system', content: SYSTEM_PROMPT },
       ...buildGPTHistory(),
-      { role: 'user', content: `Command: "${command}"\n\n${buildRichPageContext()}` }
+      { role: 'user', content: `Command: "${command}"\n\nCurrent page snapshot:\n${buildRichPageContext()}\n\nNavigation text (for vocabulary reference):\n${extractNavText()}` },
     ];
 
-    const MAX_STEPS = 12;
     let steps = 0;
     let finalResponse = '';
 
     try {
-      while (steps < MAX_STEPS) {
+      while (steps < MAX_AGENT_STEPS) {
         steps++;
-        const resp = await sendMessage({ type: 'API_REQUEST', model: 'gpt-4o', messages, tools: BROWSER_TOOLS, tool_choice: 'auto', max_tokens: 600, temperature: 0.1 });
-        if (!resp.success) { addMsg('error', `API error: ${resp.error}`); break; }
+        const resp = await sendMessage({
+          type: 'API_REQUEST',
+          model: 'gpt-4o',
+          messages,
+          tools: BROWSER_TOOLS,
+          tool_choice: 'auto',
+          max_tokens: 800,
+          temperature: 0.05,
+        });
 
-        const choice = resp.data.choices?.[0];
-        if (!choice) break;
+        if (!resp || !resp.success) {
+          const errMsg = resp?.error || 'Unknown API error';
+          addMsg('error', `API error: ${errMsg}`);
+          break;
+        }
 
-        if (choice.finish_reason === 'tool_calls' && choice.message.tool_calls?.length) {
-          messages.push({ role: 'assistant', content: choice.message.content || null, tool_calls: choice.message.tool_calls });
+        const choice = resp.data?.choices?.[0];
+        if (!choice) {
+          addMsg('error', 'No response from AI');
+          break;
+        }
+
+        if (choice.finish_reason === 'tool_calls' && choice.message?.tool_calls?.length) {
+          messages.push({
+            role: 'assistant',
+            content: choice.message.content || null,
+            tool_calls: choice.message.tool_calls,
+          });
 
           for (const tc of choice.message.tool_calls) {
             let args;
-            try { args = JSON.parse(tc.function.arguments); } catch(e) { args = {}; }
+            try { args = JSON.parse(tc.function.arguments); } catch (e) { args = {}; }
 
             const toolLabel = formatToolLabel(tc.function.name, args);
-            addMsg('action', `→ ${toolLabel}`);
+            addMsg('action', toolLabel);
 
-            const result = await executeBrowserTool(tc.function.name, args);
-            messages.push({ role: 'tool', content: typeof result === 'string' ? result : JSON.stringify(result), tool_call_id: tc.id });
+            let result;
+            try {
+              result = await executeBrowserTool(tc.function.name, args);
+            } catch (e) {
+              result = { success: false, error: e.message };
+            }
 
-            if (messages.length > 30) messages.splice(2, 2);
+            messages.push({
+              role: 'tool',
+              content: typeof result === 'string' ? result : JSON.stringify(result),
+              tool_call_id: tc.id,
+            });
+
+            // Prevent message array from growing too large
+            if (messages.length > 35) messages.splice(2, 2);
           }
 
-          messages.push({ role: 'user', content: 'Updated page:\n' + buildRichPageContext() });
+          // Wait a moment for DOM to settle after actions
+          await wait(300);
+          messages.push({ role: 'user', content: 'Updated page state:\n' + buildRichPageContext() + '\nNavigation vocabulary:\n' + extractNavText() });
         } else {
           finalResponse = choice.message?.content?.trim() || 'Done.';
           break;
         }
       }
 
-      if (steps >= MAX_STEPS && !finalResponse) finalResponse = 'I reached the maximum steps. The task may not be fully complete.';
+      if (steps >= MAX_AGENT_STEPS && !finalResponse) {
+        finalResponse = 'I reached the maximum steps. The task may not be fully complete.';
+      }
     } catch (err) {
       finalResponse = `Something went wrong: ${err.message}`;
     }
 
     if (finalResponse) {
       addMsg('response', finalResponse);
-      speakResponse(finalResponse);
 
-      // ── Persist the command + response to history ──────────
+      // Persist the command + response to history
       const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-      conversationHistory.push({ role: 'user',      type: 'command',  text: command,       time });
-      conversationHistory.push({ role: 'assistant',  type: 'response', text: finalResponse, time });
+      conversationHistory.push({ role: 'user', type: 'command', text: command, time });
+      conversationHistory.push({ role: 'assistant', type: 'response', text: finalResponse, time });
       saveHistory();
     }
 
@@ -182,14 +287,14 @@ SAFETY: If the user's command involves "buy", "checkout", "purchase", or "pay" �
 
   function formatToolLabel(name, args) {
     switch (name) {
-      case 'click_element':    return `Clicking: ${args.description || args.selector}`;
+      case 'click_element':    return `Clicking: ${args.description || args.selector || 'element'}`;
       case 'type_text':        return `Typing: "${(args.text || '').slice(0, 40)}"`;
       case 'press_key':        return `Press key: ${args.key}`;
       case 'navigate_to':      return `Navigating to: ${args.url}`;
       case 'scroll_page':      return `Scrolling ${args.direction}`;
       case 'find_elements':    return `Searching for: ${args.description}`;
-      case 'get_page_context': return `Reading page`;
-      case 'read_page':        return `Reading page content`;
+      case 'get_page_context': return 'Reading page context';
+      case 'read_page':        return 'Reading page content';
       case 'select_option':    return `Selecting: ${args.value}`;
       default:                 return name;
     }
@@ -198,59 +303,184 @@ SAFETY: If the user's command involves "buy", "checkout", "purchase", or "pay" �
   // ─── Browser tool executor ────────────────────────────────
   async function executeBrowserTool(name, args) {
     switch (name) {
-      case 'get_page_context': return buildRichPageContext();
-      case 'find_elements':    return findElementsByDescription(args.description || '');
+      case 'get_page_context':
+        return buildRichPageContext();
+
+      case 'find_elements':
+        return findElementsByDescription(args.description || '');
 
       case 'click_element': {
-        const el = resolveElement(args.selector);
-        if (el) { highlightElement(el); el.click(); el.focus(); await wait(400); return { success: true, clicked: args.description }; }
+        // Try direct selector first
+        let el = resolveElement(args.selector);
+        if (el) {
+          highlightElement(el);
+          el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          await wait(200);
+          el.click();
+          el.focus();
+          await wait(500);
+          return { success: true, clicked: args.description || describeElement(el) || args.selector };
+        }
+        // Try finding by description
         const found = findElementsByDescription(args.description || args.selector || '');
         if (found.elements?.length > 0) {
           const fb = resolveElement(found.elements[0].selector);
-          if (fb) { highlightElement(fb); fb.click(); fb.focus(); await wait(400); return { success: true, clicked: found.elements[0].description }; }
+          if (fb) {
+            highlightElement(fb);
+            fb.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            await wait(200);
+            fb.click();
+            fb.focus();
+            await wait(500);
+            return { success: true, clicked: found.elements[0].description };
+          }
         }
-        return { success: false, error: `Could not find element: ${args.selector}` };
+        return { success: false, error: `Could not find element: ${args.selector || args.description}` };
       }
 
       case 'type_text': {
+        // ── Resolve the target element ──────────────────────────
         let el = args.selector ? resolveElement(args.selector) : null;
-        if (!el) el = document.querySelector('input:focus, textarea:focus') || document.querySelector('input[type="text"], input[type="search"], input:not([type]), textarea');
-        if (!el) return { success: false, error: 'No input field found' };
-        highlightElement(el); el.focus();
-        if (args.clear_first !== false) { el.value = ''; el.dispatchEvent(new Event('input', { bubbles: true })); }
-        el.value = (el.value || '') + (args.text || '');
-        el.dispatchEvent(new Event('input', { bubbles: true }));
-        el.dispatchEvent(new Event('change', { bubbles: true }));
-        await wait(200);
-        return { success: true, typed: args.text };
+        if (!el) {
+          el = document.querySelector('input:focus, textarea:focus, [contenteditable]:focus');
+          if (!el) {
+            const candidates = document.querySelectorAll(
+              'input[type="text"], input[type="search"], input[type="email"], ' +
+              'input[type="url"], input:not([type]), textarea, [contenteditable="true"]'
+            );
+            for (const inp of candidates) {
+              if (inp.closest('#accessai-sidebar')) continue;
+              const s = window.getComputedStyle(inp);
+              if (s.display !== 'none' && s.visibility !== 'hidden') { el = inp; break; }
+            }
+          }
+        }
+        if (!el) return { success: false, error: 'No input field found on this page' };
+
+        highlightElement(el);
+        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        el.focus();
+        await wait(120);
+
+        const textToType = args.text || '';
+        const isContentEditable = el.isContentEditable;
+
+        if (isContentEditable) {
+          // ── ContentEditable (Gmail, Notion, etc.) ───────────────
+          if (args.clear_first !== false) el.textContent = '';
+          el.focus();
+          document.execCommand('selectAll');
+          document.execCommand('delete');
+          document.execCommand('insertText', false, textToType);
+          el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: textToType }));
+          // Move cursor to end
+          const range = document.createRange();
+          range.selectNodeContents(el);
+          range.collapse(false);
+          const sel = window.getSelection();
+          sel.removeAllRanges();
+          sel.addRange(range);
+        } else {
+          // ── Regular <input> / <textarea> ──────────────────────
+          // Strategy: execCommand('insertText') is the gold standard —
+          // it integrates with React/Angular/Vue's synthetic event system.
+
+          if (args.clear_first !== false) {
+            el.focus();
+            // Select all existing text
+            el.select?.();
+            document.execCommand('selectAll');
+            await wait(30);
+            // Delete selected content via execCommand (React-safe)
+            document.execCommand('delete');
+            await wait(30);
+            // Also nuke via native setter just in case execCommand didn't clear
+            const ns = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set
+                    || Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
+            if (ns) ns.call(el, ''); else el.value = '';
+            el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward' }));
+            await wait(30);
+          }
+
+          el.focus();
+          el.select?.();
+
+          // ─ Method 1: execCommand (works with Google, React, Angular, Vue, Svelte) ─
+          let typed = false;
+          try {
+            typed = document.execCommand('insertText', false, textToType);
+          } catch (_) { typed = false; }
+
+          // ─ Method 2: InputEvent with insertText (modern browsers) ─
+          if (!typed || el.value !== textToType) {
+            const ns = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set
+                    || Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
+            if (ns) ns.call(el, textToType); else el.value = textToType;
+            el.dispatchEvent(new InputEvent('input',  { bubbles: true, cancelable: true, inputType: 'insertText', data: textToType }));
+            el.dispatchEvent(new InputEvent('change', { bubbles: true, cancelable: true }));
+          }
+
+          // ─ Method 3: Character-by-character keyboard events (legacy fallback) ─
+          if (el.value !== textToType) {
+            for (const char of textToType) {
+              const kp = { key: char, charCode: char.charCodeAt(0), keyCode: char.charCodeAt(0), which: char.charCodeAt(0), bubbles: true, cancelable: true };
+              el.dispatchEvent(new KeyboardEvent('keydown',  kp));
+              el.dispatchEvent(new KeyboardEvent('keypress', kp));
+              el.dispatchEvent(new KeyboardEvent('keyup',    kp));
+            }
+          }
+        }
+
+        await wait(300);
+        const finalVal = isContentEditable ? el.textContent : el.value;
+        return { success: true, typed: textToType, actual_value: finalVal?.slice(0, 80) };
       }
 
       case 'press_key': {
         const target = args.selector ? resolveElement(args.selector) : document.activeElement;
         if (target) target.focus();
-        const keyMap = { 'Enter': { key: 'Enter', code: 'Enter', keyCode: 13 }, 'Escape': { key: 'Escape', code: 'Escape', keyCode: 27 }, 'Tab': { key: 'Tab', code: 'Tab', keyCode: 9 }, 'Space': { key: ' ', code: 'Space', keyCode: 32 }, 'Backspace': { key: 'Backspace', code: 'Backspace', keyCode: 8 }, 'ArrowDown': { key: 'ArrowDown', code: 'ArrowDown', keyCode: 40 }, 'ArrowUp': { key: 'ArrowUp', code: 'ArrowUp', keyCode: 38 } };
+        const keyMap = {
+          'Enter':     { key: 'Enter',     code: 'Enter',     keyCode: 13 },
+          'Escape':    { key: 'Escape',    code: 'Escape',    keyCode: 27 },
+          'Tab':       { key: 'Tab',       code: 'Tab',       keyCode: 9 },
+          'Space':     { key: ' ',         code: 'Space',     keyCode: 32 },
+          'Backspace': { key: 'Backspace', code: 'Backspace', keyCode: 8 },
+          'ArrowDown': { key: 'ArrowDown', code: 'ArrowDown', keyCode: 40 },
+          'ArrowUp':   { key: 'ArrowUp',   code: 'ArrowUp',   keyCode: 38 },
+          'ArrowLeft': { key: 'ArrowLeft', code: 'ArrowLeft', keyCode: 37 },
+          'ArrowRight':{ key: 'ArrowRight',code: 'ArrowRight',keyCode: 39 },
+        };
         const k = keyMap[args.key] || { key: args.key, code: args.key, keyCode: 0 };
         const activeEl = target || document.body;
-        activeEl.dispatchEvent(new KeyboardEvent('keydown',  { ...k, bubbles: true, cancelable: true }));
+        activeEl.dispatchEvent(new KeyboardEvent('keydown', { ...k, bubbles: true, cancelable: true }));
         activeEl.dispatchEvent(new KeyboardEvent('keypress', { ...k, bubbles: true, cancelable: true }));
-        activeEl.dispatchEvent(new KeyboardEvent('keyup',    { ...k, bubbles: true }));
-        if (args.key === 'Enter' && activeEl.tagName === 'INPUT' && activeEl.form) activeEl.form.submit();
+        activeEl.dispatchEvent(new KeyboardEvent('keyup', { ...k, bubbles: true }));
+        if (args.key === 'Enter' && activeEl.tagName === 'INPUT' && activeEl.form) {
+          activeEl.form.requestSubmit ? activeEl.form.requestSubmit() : activeEl.form.submit();
+        }
         await wait(600);
         return { success: true, key: args.key };
       }
 
       case 'navigate_to': {
         let url = (args.url || '').trim();
-        if (!url) return { success: false, error: 'No URL' };
+        if (!url) return { success: false, error: 'No URL provided' };
         if (!/^https?:\/\//i.test(url)) url = 'https://' + url;
 
-        // ── Save history and a "navigating" marker BEFORE leaving ──
+        // Save history and mark for reconnection BEFORE navigating
         const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
         conversationHistory.push({ role: 'assistant', type: 'action', text: `Navigated to ${url}`, time });
         saveHistory();
+        shouldAutoReconnect = true;
 
-        addMsg('info', `Going to ${url}`);
-        setTimeout(() => { window.location.href = url; }, 400);
+        addMsg('info', `Going to ${url}…`);
+
+        // Await storage write so reconnect flag is set before page unloads
+        await new Promise(resolve => {
+          chrome.storage.local.set({ websight_should_reconnect: true }, resolve);
+        });
+        await wait(200);
+        window.location.href = url;
         return { success: true, navigating_to: url };
       }
 
@@ -267,134 +497,307 @@ SAFETY: If the user's command involves "buy", "checkout", "purchase", or "pay" �
       }
 
       case 'read_page': {
-        const el = args.selector ? resolveElement(args.selector) : document.querySelector('main, [role="main"], article') || document.body;
-        return { success: true, content: (el || document.body).innerText.trim().replace(/\s+/g, ' ').slice(0, 2000) };
+        const el = args.selector ? resolveElement(args.selector) : (document.querySelector('main, [role="main"], article') || document.body);
+        const content = (el || document.body).innerText.trim().replace(/\s+/g, ' ').slice(0, 3000);
+        return { success: true, content };
       }
 
       case 'select_option': {
         const sel = resolveElement(args.selector);
-        if (!sel || sel.tagName !== 'SELECT') return { success: false, error: 'No <select> found' };
-        const option = Array.from(sel.options).find(o => o.text.toLowerCase().includes((args.value || '').toLowerCase()) || o.value.toLowerCase() === (args.value || '').toLowerCase());
+        if (!sel || sel.tagName !== 'SELECT') return { success: false, error: 'No <select> dropdown found' };
+        const option = Array.from(sel.options).find(o =>
+          o.text.toLowerCase().includes((args.value || '').toLowerCase()) ||
+          o.value.toLowerCase() === (args.value || '').toLowerCase()
+        );
         if (!option) return { success: false, error: `Option "${args.value}" not found` };
         sel.value = option.value;
         sel.dispatchEvent(new Event('change', { bubbles: true }));
         return { success: true, selected: option.text };
       }
 
-      default: return { success: false, error: `Unknown tool: ${name}` };
+      default:
+        return { success: false, error: `Unknown tool: ${name}` };
     }
   }
 
   // ─── Element resolution ───────────────────────────────────
   function resolveElement(selector) {
     if (!selector) return null;
+
+    // XPath
     if (selector.startsWith('xpath:') || selector.startsWith('//')) {
-      try { const r = document.evaluate(selector.replace('xpath:', ''), document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null); if (r.singleNodeValue) return r.singleNodeValue; } catch(e) {}
+      try {
+        const xpath = selector.replace(/^xpath:/, '');
+        const r = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
+        if (r.singleNodeValue) return r.singleNodeValue;
+      } catch (e) {}
     }
-    try { const el = document.querySelector(selector); if (el) return el; } catch(e) {}
-    try { const el = document.querySelector(`[aria-label*="${CSS.escape(selector)}"]`); if (el) return el; } catch(e) {}
+
+    // CSS selector
+    try {
+      const el = document.querySelector(selector);
+      if (el && !el.closest('#accessai-sidebar')) return el;
+    } catch (e) {}
+
+    // aria-label match
+    try {
+      const escaped = CSS.escape(selector);
+      const el = document.querySelector(`[aria-label="${escaped}"]`) || document.querySelector(`[aria-label*="${escaped}"]`);
+      if (el && !el.closest('#accessai-sidebar')) return el;
+    } catch (e) {}
+
+    // Text content match
     return findByText(selector);
   }
 
   function findByText(text) {
     if (!text || typeof text !== 'string') return null;
-    const lower = text.toLowerCase().trim().slice(0, 60);
-    for (const el of document.querySelectorAll('button, a, [role="button"], [role="link"], input[type="submit"], input[type="button"]')) {
+    const lower = text.toLowerCase().trim().slice(0, 80);
+    const candidates = document.querySelectorAll('button, a, [role="button"], [role="link"], input[type="submit"], input[type="button"], [role="menuitem"], [role="tab"]');
+    let bestMatch = null;
+    let bestScore = 0;
+
+    for (const el of candidates) {
       if (el.closest('#accessai-sidebar')) continue;
+      const style = window.getComputedStyle(el);
+      if (style.display === 'none' || style.visibility === 'hidden') continue;
+
       const t = (el.textContent || el.value || el.getAttribute('aria-label') || '').toLowerCase().trim();
-      if (t === lower || t.includes(lower) || lower.includes(t.slice(0, 20))) return el;
+      if (!t) continue;
+
+      let score = 0;
+      if (t === lower) score = 100; // Exact match
+      else if (t.includes(lower)) score = 80;
+      else if (lower.includes(t) && t.length > 3) score = 60;
+      else {
+        // Word overlap scoring
+        const words = lower.split(/\s+/);
+        const matchedWords = words.filter(w => w.length > 2 && t.includes(w));
+        score = matchedWords.length * 15;
+      }
+
+      if (score > bestScore) {
+        bestScore = score;
+        bestMatch = el;
+      }
     }
-    return null;
+
+    return bestScore >= 15 ? bestMatch : null;
   }
 
   function findElementsByDescription(description) {
     const lower = (description || '').toLowerCase();
     const words = lower.split(/\s+/).filter(w => w.length > 2);
-    const results = []; const seen = new Set();
-    document.querySelectorAll('a[href], button, input:not([type="hidden"]), select, textarea, [role="button"], [role="link"], [role="menuitem"], [role="tab"], [role="combobox"], [tabindex]:not([tabindex="-1"])').forEach(el => {
+    const results = [];
+    const seen = new Set();
+
+    const interactiveSelector = 'a[href], button, input:not([type="hidden"]), select, textarea, [role="button"], [role="link"], [role="menuitem"], [role="tab"], [role="combobox"], [role="option"], [tabindex]:not([tabindex="-1"])';
+
+    document.querySelectorAll(interactiveSelector).forEach((el, pageIndex) => {
       if (el.closest('#accessai-sidebar')) return;
+      const style = window.getComputedStyle(el);
+      if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return;
+
       const sig = generateSelector(el);
       if (seen.has(sig)) return;
+
       const desc = describeElement(el) || '';
-      const searchable = [desc, el.textContent, el.getAttribute('aria-label'), el.getAttribute('placeholder'), el.getAttribute('name'), el.getAttribute('type'), el.getAttribute('value')].filter(Boolean).join(' ').toLowerCase();
+      if (!desc) return;
+
+      const searchable = [
+        desc,
+        el.textContent,
+        el.getAttribute('aria-label'),
+        el.getAttribute('placeholder'),
+        el.getAttribute('name'),
+        el.getAttribute('type'),
+        el.getAttribute('value'),
+        el.getAttribute('title'),
+        el.getAttribute('alt'),
+      ].filter(Boolean).join(' ').toLowerCase();
+
       const score = words.filter(w => searchable.includes(w)).length;
-      if (score > 0) { seen.add(sig); results.push({ description: desc, selector: sig, score }); }
+      if (score > 0) {
+        seen.add(sig);
+        results.push({ description: desc, selector: sig, score, pageIndex });
+      }
     });
-    results.sort((a, b) => b.score - a.score);
-    return { count: results.length, elements: results.slice(0, 10) };
+
+    results.sort((a, b) => b.score - a.score || a.pageIndex - b.pageIndex);
+    return { count: results.length, elements: results.slice(0, 15) };
+  }
+
+  // ─── Extract navigation text for vocabulary reference ───
+  function extractNavText() {
+    const navSelectors = 'nav, [role="navigation"], header, .nav, .navbar, .menu, .site-nav, #nav, #navigation, #menu';
+    const navEls = document.querySelectorAll(navSelectors);
+    const texts = new Set();
+    navEls.forEach(nav => {
+      nav.querySelectorAll('a, button, [role="menuitem"], [role="tab"]').forEach(el => {
+        if (el.closest('#accessai-sidebar')) return;
+        const t = (el.textContent || el.getAttribute('aria-label') || '').trim().replace(/\s+/g, ' ');
+        if (t && t.length > 1 && t.length < 80) texts.add(t);
+      });
+    });
+    if (texts.size === 0) {
+      // Fallback: collect all top-level links
+      document.querySelectorAll('a[href]').forEach(a => {
+        if (a.closest('#accessai-sidebar')) return;
+        const t = a.textContent.trim().replace(/\s+/g, ' ');
+        if (t && t.length > 1 && t.length < 60) texts.add(t);
+      });
+    }
+    const result = Array.from(texts).slice(0, 60).join(' | ');
+    return result || '(no navigation text found)';
   }
 
   function buildRichPageContext() {
     const lines = [`URL: ${window.location.href}`, `Title: ${document.title}`];
-    const headings = Array.from(document.querySelectorAll('h1,h2,h3')).slice(0, 8);
-    if (headings.length) lines.push('Headings: ' + headings.map(h => `[${h.tagName}] ${h.textContent.trim().slice(0, 50)}`).join(' | '));
-    const els = []; let i = 0;
-    document.querySelectorAll('a[href], button, input:not([type="hidden"]), select, textarea, [role="button"], [role="link"], [role="menuitem"], [role="tab"], [role="combobox"]').forEach(el => {
-      if (i >= 80 || el.closest('#accessai-sidebar')) return;
+
+    // Headings
+    const headings = Array.from(document.querySelectorAll('h1,h2,h3')).slice(0, 10);
+    if (headings.length) {
+      lines.push('Headings: ' + headings.map(h => `[${h.tagName}] ${h.textContent.trim().slice(0, 60)}`).join(' | '));
+    }
+
+    // Interactive elements with index numbers for ordinal reference
+    const els = [];
+    let i = 0;
+    const interactiveSelector = 'a[href], button, input:not([type="hidden"]), select, textarea, [role="button"], [role="link"], [role="menuitem"], [role="tab"], [role="combobox"]';
+
+    document.querySelectorAll(interactiveSelector).forEach(el => {
+      if (i >= 100 || el.closest('#accessai-sidebar')) return;
       const style = window.getComputedStyle(el);
-      if (style.display === 'none' || style.visibility === 'hidden') return;
-      const desc = describeElement(el); if (!desc) return;
-      els.push(`[${i++}] ${desc} → ${generateSelector(el)}`);
+      if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return;
+      const desc = describeElement(el);
+      if (!desc) return;
+      els.push(`[${i}] ${desc} -> ${generateSelector(el)}`);
+      i++;
     });
-    lines.push(`\nInteractive elements (${i}):\n${els.join('\n')}`);
+
+    lines.push(`\nInteractive elements (${i} found):\n${els.join('\n')}`);
     return lines.join('\n');
   }
 
   function generateSelector(el) {
-    if (el.id && !/^\d/.test(el.id) && el.id.length < 50) return `#${el.id}`;
+    // Prefer stable, unique selectors
+    if (el.id && !/^\d/.test(el.id) && el.id.length < 50 && document.querySelectorAll(`#${CSS.escape(el.id)}`).length === 1) {
+      return `#${CSS.escape(el.id)}`;
+    }
+
     const tag = el.tagName.toLowerCase();
-    const aria = el.getAttribute('aria-label');
-    if (aria && aria.length < 80) return `${tag}[aria-label="${aria.replace(/"/g, "'")}"]`;
-    const testId = el.getAttribute('data-testid') || el.getAttribute('data-test-id');
+
+    const testId = el.getAttribute('data-testid') || el.getAttribute('data-test-id') || el.getAttribute('data-qa');
     if (testId) return `[data-testid="${testId}"]`;
+
+    const aria = el.getAttribute('aria-label');
+    if (aria && aria.length < 80) {
+      const escaped = aria.replace(/"/g, "'");
+      return `${tag}[aria-label="${escaped}"]`;
+    }
+
     const name = el.getAttribute('name');
-    if (name && ['input','textarea','select'].includes(tag)) return `${tag}[name="${name}"]`;
+    if (name && ['input', 'textarea', 'select'].includes(tag)) return `${tag}[name="${name}"]`;
+
     const ph = el.getAttribute('placeholder');
     if (ph && ph.length < 60) return `${tag}[placeholder="${ph.replace(/"/g, "'")}"]`;
-    const text = el.textContent?.trim().slice(0, 30);
-    if (text && el.children.length === 0) return `xpath://${tag}[normalize-space()="${text.replace(/"/g, "'")}"]`;
+
+    // href for links (use partial match for long URLs)
+    if (tag === 'a' && el.href) {
+      const href = el.getAttribute('href');
+      if (href && href.length < 80 && !href.startsWith('javascript:')) {
+        return `a[href="${href.replace(/"/g, "'")}"]`;
+      }
+    }
+
+    // Text-based XPath for leaf elements
+    const text = el.textContent?.trim().slice(0, 40);
+    if (text && el.children.length === 0 && text.length > 1) {
+      return `xpath://${tag}[normalize-space()="${text.replace(/"/g, "'")}"]`;
+    }
+
+    // nth-of-type for elements with classes
     const cls = Array.from(el.classList).filter(c => c.length > 2 && !/^\d/.test(c) && !c.match(/\d{3,}/)).slice(0, 2).join('.');
-    if (cls) return `${tag}.${cls}`; return tag;
+    if (cls) {
+      const selector = `${tag}.${cls}`;
+      const matches = document.querySelectorAll(selector);
+      if (matches.length === 1) return selector;
+      const idx = Array.from(matches).indexOf(el);
+      if (idx >= 0) return `${selector}:nth-of-type(${idx + 1})`;
+      return selector;
+    }
+
+    return tag;
   }
 
   function describeElement(el) {
-    const tag = el.tagName?.toLowerCase(); if (!tag) return null;
-    const role = el.getAttribute('role'), ariaLabel = el.getAttribute('aria-label'), text = el.textContent?.trim().slice(0, 60), alt = el.getAttribute('alt');
-    if (['hr','br','script','style'].includes(tag)) return null;
-    if (el.getAttribute('aria-hidden') === 'true') return null;
-    if (['div','span'].includes(tag) && !text && !role && !ariaLabel) return null;
-    if (tag === 'img')    return `Image: ${alt || 'no description'}`;
-    if (tag === 'a')      return `Link: ${text || ariaLabel || el.href || 'unknown'}`;
-    if (tag === 'button' || role === 'button') return `Button: ${text || ariaLabel || 'unnamed'}`;
-    if (tag === 'input')  { const t = el.type || 'text', lbl = ariaLabel || el.placeholder || el.name || ''; return `${t === 'submit' ? 'Submit button' : `Input (${t})`}: ${lbl}`; }
+    const tag = el.tagName?.toLowerCase();
+    if (!tag) return null;
+    const role = el.getAttribute('role');
+    const ariaLabel = el.getAttribute('aria-label');
+    const text = el.textContent?.trim().slice(0, 80);
+    const alt = el.getAttribute('alt');
+    const title = el.getAttribute('title');
+
+    if (['hr', 'br', 'script', 'style', 'noscript', 'svg', 'path'].includes(tag)) return null;
+    if (el.getAttribute('aria-hidden') === 'true' && !ariaLabel) return null;
+    if (['div', 'span'].includes(tag) && !text && !role && !ariaLabel) return null;
+
+    if (tag === 'img') return `Image: ${alt || title || 'no description'}`;
+    if (tag === 'a') return `Link: ${text || ariaLabel || title || el.href || 'unknown'}`;
+    if (tag === 'button' || role === 'button') return `Button: ${text || ariaLabel || title || 'unnamed'}`;
+    if (tag === 'input') {
+      const t = el.type || 'text';
+      const lbl = ariaLabel || el.placeholder || el.name || title || '';
+      return `${t === 'submit' ? 'Submit button' : `Input (${t})`}: ${lbl}`;
+    }
     if (tag === 'select') return `Dropdown: ${ariaLabel || el.name || 'options'}`;
-    if (['h1','h2','h3','h4','h5','h6'].includes(tag)) return `Heading: ${text}`;
+    if (['h1', 'h2', 'h3', 'h4', 'h5', 'h6'].includes(tag)) return `Heading: ${text}`;
     if (tag === 'textarea') return `Text area: ${ariaLabel || el.placeholder || el.name || ''}`;
-    if (ariaLabel) return ariaLabel; return null;
+    if (role === 'menuitem') return `Menu item: ${text || ariaLabel || 'unnamed'}`;
+    if (role === 'tab') return `Tab: ${text || ariaLabel || 'unnamed'}`;
+    if (role === 'link') return `Link: ${text || ariaLabel || 'unnamed'}`;
+    if (ariaLabel) return ariaLabel;
+    if (title) return title;
+    return null;
   }
 
   // ─── Confirm / safety ─────────────────────────────────────
   function checkConfirmPhrase(text) {
     if (!pendingConfirm) return false;
-    if (/\bconfirm\b/i.test(text)) { const cmd = pendingConfirm + ' (user confirmed)'; pendingConfirm = null; runAgentTask(cmd); }
-    else { pendingConfirm = null; addMsg('system', 'Action cancelled.'); }
+    if (/\bconfirm\b/i.test(text)) {
+      const cmd = pendingConfirm + ' (user confirmed)';
+      pendingConfirm = null;
+      runAgentTask(cmd);
+    } else {
+      pendingConfirm = null;
+      addMsg('system', 'Action cancelled.');
+    }
     return true;
   }
 
   // ─── Orb state ────────────────────────────────────────────
   function setOrbState(state) {
-    const orb = document.getElementById('aai-ws-start-orb'), label = paneEl?.querySelector('.aai-start-label');
+    const orb = document.getElementById('aai-ws-start-orb');
+    const label = paneEl?.querySelector('.aai-start-label');
     if (!orb) return;
     orb.classList.remove('aai-orb-connecting', 'aai-orb-active', 'aai-orb-speaking');
     switch (state) {
-      case 'thinking': orb.classList.add('aai-orb-connecting'); if (label) label.textContent = 'Working...'; window.__accessai?.setFooterStatus('Web-Sight: Working...'); break;
-      case 'active':   orb.classList.add('aai-orb-active');     if (label) label.textContent = 'Listening...'; window.__accessai?.setFooterStatus('Web-Sight: Listening...'); break;
-      case 'speaking': orb.classList.add('aai-orb-speaking');   window.__accessai?.setFooterStatus('Web-Sight: Speaking...'); break;
+      case 'thinking':
+        orb.classList.add('aai-orb-connecting');
+        if (label) label.textContent = 'Working...';
+        window.__accessai?.setFooterStatus('Web-Sight: Working...');
+        break;
+      case 'active':
+        orb.classList.add('aai-orb-active');
+        if (label) label.textContent = 'Listening...';
+        window.__accessai?.setFooterStatus('Web-Sight: Listening...');
+        break;
+      case 'speaking':
+        orb.classList.add('aai-orb-speaking');
+        window.__accessai?.setFooterStatus('Web-Sight: Speaking...');
+        break;
     }
-  }
-
-  function speakResponse(text) {
-    // Silent mode — responses are shown in UI only, no TTS/audio output
   }
 
   // ─── Init pane ────────────────────────────────────────────
@@ -431,17 +834,18 @@ SAFETY: If the user's command involves "buy", "checkout", "purchase", or "pay" �
       <div class="aai-ws-input-row">
         <input type="text" id="aai-ws-text-input" class="aai-ws-text-field" placeholder="Or type a command here..." aria-label="Type a command" />
         <button class="aai-ws-btn" id="aai-ws-send" aria-label="Send">&#10148;</button>
-        <button class="aai-ws-btn aai-ws-clear-history-btn" id="aai-ws-clear-history" title="Clear conversation history" aria-label="Clear history">🗑</button>
+        <button class="aai-ws-btn aai-ws-clear-history-btn" id="aai-ws-clear-history" title="Clear conversation history" aria-label="Clear history">&#128465;</button>
       </div>
     `;
 
     outputEl = document.getElementById('aai-ws-output');
     document.getElementById('aai-ws-start-orb').addEventListener('click', toggleAgent);
     document.getElementById('aai-ws-send').addEventListener('click', handleTextCommand);
-    document.getElementById('aai-ws-text-input').addEventListener('keydown', e => { if (e.key === 'Enter') handleTextCommand(); });
+    document.getElementById('aai-ws-text-input').addEventListener('keydown', e => {
+      if (e.key === 'Enter') handleTextCommand();
+    });
     document.getElementById('aai-ws-clear-history').addEventListener('click', () => {
       clearHistory();
-      // Remove all message nodes but keep hero
       const msgs = outputEl.querySelectorAll('.aai-ws-msg');
       msgs.forEach(m => m.remove());
       addMsg('system', 'Conversation cleared.');
@@ -456,21 +860,35 @@ SAFETY: If the user's command involves "buy", "checkout", "purchase", or "pay" �
     }
 
     document.addEventListener('mouseover', handleHover, true);
-    document.addEventListener('mouseout', () => { if (hoverOverlay) hoverOverlay.style.display = 'none'; }, true);
+    document.addEventListener('mouseout', () => {
+      if (hoverOverlay) hoverOverlay.style.display = 'none';
+    }, true);
 
-    // ── Restore persisted conversation history ──────────────
+    // Restore persisted conversation history
     await loadHistory();
     if (conversationHistory.length > 0) {
-      clearHero(); // shrink the hero since we have prior messages
-      addMsg('system', `↩ Restored ${conversationHistory.length} messages from previous session`);
-      // Replay history into the UI
+      clearHero();
+      addMsg('system', `Restored ${conversationHistory.length} messages from previous session`);
       for (const entry of conversationHistory) {
         replayHistoryEntry(entry);
       }
     }
+
+    // Check if we should auto-reconnect (after navigation)
+    chrome.storage.local.get('websight_should_reconnect', (result) => {
+      if (chrome.runtime.lastError) return;
+      if (result.websight_should_reconnect) {
+        chrome.storage.local.remove('websight_should_reconnect');
+        // Auto-start the agent — use a generous delay so the page and
+        // mic permissions have time to settle after navigation.
+        setTimeout(() => {
+          if (!isAgentActive) startAgent();
+        }, 1500);
+      }
+    });
   }
 
-  // Render a stored history entry into the output (no side effects)
+  // Render a stored history entry into the output
   function replayHistoryEntry(entry) {
     if (!outputEl) return;
     clearHero();
@@ -489,9 +907,9 @@ SAFETY: If the user's command involves "buy", "checkout", "purchase", or "pay" �
       return; // skip system entries during replay
     }
 
-    // Add a dimmed timestamp label for replayed entries
+    // Dimmed timestamp
     const ts = document.createElement('span');
-    ts.style.cssText = 'font-size:9px;color:#374151;margin-left:6px;font-family:monospace;';
+    ts.style.cssText = 'font-size:9px;color:#6b7280;margin-left:6px;font-family:monospace;';
     ts.textContent = entry.time || '';
     el.appendChild(ts);
 
@@ -503,36 +921,66 @@ SAFETY: If the user's command involves "buy", "checkout", "purchase", or "pay" �
   async function toggleAgent() { isAgentActive ? stopAgent() : await startAgent(); }
 
   async function startAgent() {
-    const orb = document.getElementById('aai-ws-start-orb'), label = paneEl.querySelector('.aai-start-label');
+    const orb = document.getElementById('aai-ws-start-orb');
+    const label = paneEl?.querySelector('.aai-start-label');
+    if (!orb) return;
     orb.classList.add('aai-orb-connecting');
     if (label) label.textContent = 'Connecting...';
+
     try {
       const keyResp = await sendMessage({ type: 'API_REALTIME_SESSION' });
-      if (!keyResp.success) throw new Error('Could not get API key');
+      if (!keyResp?.success) throw new Error('Could not get API key');
       apiKey = keyResp.apiKey;
-      micStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, sampleRate: 24000, channelCount: 1 } });
+
+      micStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+          sampleRate: 24000,
+          channelCount: 1,
+        },
+      });
+
       playbackContext = new AudioContext({ sampleRate: 24000 });
       nextStartTime = 0;
+      reconnectAttempts = 0;
+
       await connectWebSocket();
+
+      // Tell background we're active (for reconnection after nav)
+      shouldAutoReconnect = true;
+      sendMessage({ type: 'WEBSIGHT_ACTIVE_STATE', active: true }).catch(() => {});
     } catch (err) {
       orb.classList.remove('aai-orb-connecting');
       if (label) label.textContent = 'Start Web-Sight';
-      addMsg('error', err.message);
+      addMsg('error', err.message || 'Failed to start');
       stopAgent(false);
     }
   }
 
   function stopAgent(showMsg = true) {
-    isAgentActive = false; isTaskRunning = false;
-    if (micProcessor) { try { micProcessor.disconnect(); } catch(e){} micProcessor = null; }
-    if (micContext)   { try { micContext.close(); }        catch(e){} micContext = null; }
-    if (micStream)    { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
-    if (ws)           { try { ws.close(); }                catch(e){} ws = null; }
-    if (playbackContext) { try { playbackContext.close(); } catch(e){} playbackContext = null; }
+    isAgentActive = false;
+    isTaskRunning = false;
+    shouldAutoReconnect = false;
+
+    if (micProcessor) { try { micProcessor.disconnect(); } catch (e) {} micProcessor = null; }
+    if (micContext)    { try { micContext.close(); }        catch (e) {} micContext = null; }
+    if (micStream)     { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+    if (ws)            { try { ws.close(); }               catch (e) {} ws = null; }
+    if (playbackContext) { try { playbackContext.close(); } catch (e) {} playbackContext = null; }
+
     pendingConfirm = null;
-    const orb = document.getElementById('aai-ws-start-orb'), label = paneEl?.querySelector('.aai-start-label'), sublabel = paneEl?.querySelector('.aai-start-sublabel'), hero = document.getElementById('aai-ws-hero');
-    if (orb)     orb.classList.remove('aai-orb-connecting', 'aai-orb-active', 'aai-orb-speaking');
-    if (label)   label.textContent = 'Start Web-Sight';
+    chrome.storage.local.remove('websight_should_reconnect');
+    sendMessage({ type: 'WEBSIGHT_ACTIVE_STATE', active: false }).catch(() => {});
+
+    const orb = document.getElementById('aai-ws-start-orb');
+    const label = paneEl?.querySelector('.aai-start-label');
+    const sublabel = paneEl?.querySelector('.aai-start-sublabel');
+    const hero = document.getElementById('aai-ws-hero');
+
+    if (orb) orb.classList.remove('aai-orb-connecting', 'aai-orb-active', 'aai-orb-speaking');
+    if (label) label.textContent = 'Start Web-Sight';
     if (sublabel) sublabel.textContent = 'Hands-free AI that controls the browser by your voice';
     if (hero && conversationHistory.length === 0) hero.classList.remove('aai-hero-compact');
     if (showMsg) addMsg('system', 'Agent stopped.');
@@ -542,84 +990,198 @@ SAFETY: If the user's command involves "buy", "checkout", "purchase", or "pay" �
   // ─── WebSocket ────────────────────────────────────────────
   async function connectWebSocket() {
     return new Promise((resolve, reject) => {
-      ws = new WebSocket('wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17', ['realtime', `openai-insecure-api-key.${apiKey}`, 'openai-beta.realtime-v1']);
+      const timeout = setTimeout(() => {
+        try { ws?.close(); } catch (e) {}
+        reject(new Error('WebSocket connection timed out'));
+      }, 15000);
+
+      ws = new WebSocket(
+        'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17',
+        ['realtime', `openai-insecure-api-key.${apiKey}`, 'openai-beta.realtime-v1']
+      );
+
       ws.onopen = () => {
-        ws.send(JSON.stringify({ type: 'session.update', session: { modalities: ['text', 'audio'], instructions: 'You are a silent voice synthesizer. You only speak when an assistant message is explicitly injected. You NEVER respond to user speech on your own. Stay completely silent until spoken to.', voice: 'alloy', input_audio_format: 'pcm16', output_audio_format: 'pcm16', input_audio_transcription: { model: 'whisper-1' }, turn_detection: { type: 'server_vad', threshold: 0.5, prefix_padding_ms: 200, silence_duration_ms: 700, create_response: false }, temperature: 0.7, max_response_output_tokens: 150 } }));
-        isAgentActive = true; setOrbState('active');
-        addMsg('system', 'Web-Sight connected — speak your command!');
-        startMicStreaming(); resolve();
+        clearTimeout(timeout);
+        ws.send(JSON.stringify({
+          type: 'session.update',
+          session: {
+            modalities: ['text', 'audio'],
+            instructions: 'You are a transcription service. Your ONLY job: transcribe every spoken word into English text. ' +
+              'ALWAYS output in English regardless of the spoken language. ' +
+              'Never add commentary, greetings, or assistant responses. ' +
+              'Never produce any audio output. Transcription only.',
+            voice: 'alloy',
+            input_audio_format: 'pcm16',
+            output_audio_format: 'pcm16',
+            input_audio_transcription: { model: 'whisper-1', language: 'en' },
+            turn_detection: {
+              type: 'server_vad',
+              threshold: 0.45,
+              prefix_padding_ms: 300,
+              silence_duration_ms: 800,
+              create_response: false,  // never auto-respond — we handle this via GPT-4o agent
+            },
+            temperature: 0.6,
+            max_response_output_tokens: 1,  // near-zero: no meaningful AI response needed
+          },
+        }));
+
+        isAgentActive = true;
+        setOrbState('active');
+        addMsg('system', 'Web-Sight connected. Speak your command!');
+        startMicStreaming();
+        resolve();
       };
-      ws.onmessage = e => { try { handleRealtimeEvent(JSON.parse(e.data)); } catch(ex) {} };
-      ws.onerror   = ()  => reject(new Error('WebSocket connection failed'));
-      ws.onclose   = ()  => { if (isAgentActive) setTimeout(async () => { if (isAgentActive) { try { await connectWebSocket(); } catch(err) { stopAgent(); } } }, 2000); };
+
+      ws.onmessage = e => {
+        try { handleRealtimeEvent(JSON.parse(e.data)); } catch (ex) {}
+      };
+
+      ws.onerror = () => {
+        clearTimeout(timeout);
+        reject(new Error('WebSocket connection failed'));
+      };
+
+      ws.onclose = () => {
+        if (!isAgentActive || !shouldAutoReconnect) return;
+        reconnectAttempts++;
+        if (reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
+          addMsg('error', 'Connection lost after multiple retries. Click orb to restart.');
+          stopAgent(false);
+          return;
+        }
+        const delay = Math.min(RECONNECT_BASE_DELAY * reconnectAttempts, 10000);
+        addMsg('system', `Reconnecting... (attempt ${reconnectAttempts})`);
+        setTimeout(async () => {
+          if (!isAgentActive) return;
+          try {
+            await connectWebSocket();
+            reconnectAttempts = 0;
+          } catch (err) {
+            // Will retry via the next close handler
+          }
+        }, delay);
+      };
     });
   }
 
   // ─── Mic streaming ────────────────────────────────────────
   function startMicStreaming() {
-    micContext = new AudioContext({ sampleRate: 24000 });
-    const source = micContext.createMediaStreamSource(micStream);
-    micProcessor = micContext.createScriptProcessor(2048, 1, 1);
-    micProcessor.onaudioprocess = (e) => {
-      if (!ws || ws.readyState !== WebSocket.OPEN) return;
-      const f32 = e.inputBuffer.getChannelData(0), int16 = new Int16Array(f32.length);
-      for (let i = 0; i < f32.length; i++) { const s = Math.max(-1, Math.min(1, f32[i])); int16[i] = s < 0 ? s * 32768 : s * 32767; }
-      const bytes = new Uint8Array(int16.buffer); let bin = '';
-      for (let i = 0; i < bytes.byteLength; i++) bin += String.fromCharCode(bytes[i]);
-      ws.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: btoa(bin) }));
-    };
-    source.connect(micProcessor); micProcessor.connect(micContext.destination);
+    if (!micStream) return;
+    try {
+      micContext = new AudioContext({ sampleRate: 24000 });
+      const source = micContext.createMediaStreamSource(micStream);
+      micProcessor = micContext.createScriptProcessor(2048, 1, 1);
+      micProcessor.onaudioprocess = (e) => {
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        const f32 = e.inputBuffer.getChannelData(0);
+        const int16 = new Int16Array(f32.length);
+        for (let i = 0; i < f32.length; i++) {
+          const s = Math.max(-1, Math.min(1, f32[i]));
+          int16[i] = s < 0 ? s * 32768 : s * 32767;
+        }
+        const bytes = new Uint8Array(int16.buffer);
+        let bin = '';
+        for (let i = 0; i < bytes.byteLength; i++) bin += String.fromCharCode(bytes[i]);
+        try {
+          ws.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: btoa(bin) }));
+        } catch (e) {}
+      };
+      source.connect(micProcessor);
+      micProcessor.connect(micContext.destination);
+    } catch (e) {
+      console.error('[Web-Sight] Mic streaming setup failed:', e);
+    }
   }
 
   // ─── Realtime events ──────────────────────────────────────
   function handleRealtimeEvent(ev) {
     switch (ev.type) {
-      case 'input_audio_buffer.speech_started': setOrbState('speaking'); stopAudioPlayback(); break;
-      case 'input_audio_buffer.speech_stopped': if (!isTaskRunning) setOrbState('active'); break;
+      case 'input_audio_buffer.speech_started':
+        setOrbState('speaking');
+        stopAudioPlayback();
+        break;
+
+      case 'input_audio_buffer.speech_stopped':
+        if (!isTaskRunning) setOrbState('active');
+        break;
+
       case 'conversation.item.input_audio_transcription.completed':
         if (ev.transcript?.trim()) {
-          const t = ev.transcript.trim(); addMsg('user', t);
+          const t = ev.transcript.trim();
+          addMsg('user', t);
           if (!checkConfirmPhrase(t)) runAgentTask(t);
         }
         break;
-      case 'response.audio.delta': if (ev.delta) scheduleAudioChunk(ev.delta); break;
-      case 'response.done': if (!isTaskRunning) setOrbState('active'); break;
-      case 'error': addMsg('error', ev.error?.message || 'API error'); break;
+
+      case 'response.audio.delta':
+        if (ev.delta) scheduleAudioChunk(ev.delta);
+        break;
+
+      case 'response.done':
+        if (!isTaskRunning) setOrbState('active');
+        break;
+
+      case 'error':
+        console.warn('[Web-Sight] API error:', ev.error?.message || ev.error?.code);
+        if (ev.error?.code === 'session_expired') {
+          addMsg('system', 'Session expired. Reconnecting...');
+          if (ws) { try { ws.close(); } catch (e) {} }
+        }
+        break;
     }
   }
 
   // ─── Audio playback ───────────────────────────────────────
   function scheduleAudioChunk(b64) {
-    if (!playbackContext) return;
-    const bin = atob(b64), bytes = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-    const int16 = new Int16Array(bytes.buffer), f32 = new Float32Array(int16.length);
-    for (let i = 0; i < int16.length; i++) f32[i] = int16[i] / 32768.0;
-    const buf = playbackContext.createBuffer(1, f32.length, 24000); buf.getChannelData(0).set(f32);
-    const src = playbackContext.createBufferSource(); src.buffer = buf; src.connect(playbackContext.destination);
-    const startAt = Math.max(playbackContext.currentTime, nextStartTime); src.start(startAt); nextStartTime = startAt + buf.duration;
+    if (!playbackContext || playbackContext.state === 'closed') return;
+    try {
+      const bin = atob(b64);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      const int16 = new Int16Array(bytes.buffer);
+      const f32 = new Float32Array(int16.length);
+      for (let i = 0; i < int16.length; i++) f32[i] = int16[i] / 32768.0;
+      const buf = playbackContext.createBuffer(1, f32.length, 24000);
+      buf.getChannelData(0).set(f32);
+      const src = playbackContext.createBufferSource();
+      src.buffer = buf;
+      src.connect(playbackContext.destination);
+      const startAt = Math.max(playbackContext.currentTime, nextStartTime);
+      src.start(startAt);
+      nextStartTime = startAt + buf.duration;
+    } catch (e) {}
   }
-  function stopAudioPlayback() { if (playbackContext) nextStartTime = playbackContext.currentTime; }
+
+  function stopAudioPlayback() {
+    if (playbackContext && playbackContext.state !== 'closed') {
+      nextStartTime = playbackContext.currentTime;
+    }
+  }
 
   // ─── Text input ───────────────────────────────────────────
   function handleTextCommand() {
-    const input = document.getElementById('aai-ws-text-input'), text = input.value.trim();
-    if (!text) return; input.value = '';
+    const input = document.getElementById('aai-ws-text-input');
+    if (!input) return;
+    const text = input.value.trim();
+    if (!text) return;
+    input.value = '';
     addMsg('user', text);
     if (!checkConfirmPhrase(text)) runAgentTask(text);
   }
 
   // ─── Hover descriptions ───────────────────────────────────
   function handleHover(e) {
-    if (!initialized) return;
+    if (!initialized || !hoverOverlay) return;
     const target = e.target;
     if (!target || target.closest('#accessai-sidebar') || target.closest('#accessai-ws-hover-overlay')) return;
     const desc = describeElement(target);
     if (!desc) { hoverOverlay.style.display = 'none'; return; }
-    hoverOverlay.textContent = desc; hoverOverlay.style.display = 'block';
+    hoverOverlay.textContent = desc;
+    hoverOverlay.style.display = 'block';
     const rect = target.getBoundingClientRect();
     hoverOverlay.style.left = (rect.left + 260 > window.innerWidth - 380 ? rect.left - 270 : rect.left) + 'px';
-    hoverOverlay.style.top  = (rect.bottom + 6) + 'px';
+    hoverOverlay.style.top = (rect.bottom + 6) + 'px';
   }
 
   // ─── UI helpers ───────────────────────────────────────────
@@ -633,37 +1195,99 @@ SAFETY: If the user's command involves "buy", "checkout", "purchase", or "pay" �
     clearHero();
     const el = document.createElement('div');
     el.className = `aai-ws-msg aai-ws-msg-${type}`;
-    if (type === 'user')     el.innerHTML = `<span class="aai-ws-msg-label">You</span><span class="aai-ws-msg-body">${escHtml(text)}</span>`;
-    else if (type === 'response') el.innerHTML = `<span class="aai-ws-ai-label">Web-Sight</span><span class="aai-ws-ai-text">${escHtml(text)}</span>`;
-    else el.textContent = text;
+    if (type === 'user') {
+      el.innerHTML = `<span class="aai-ws-msg-label">You</span><span class="aai-ws-msg-body">${escHtml(text)}</span>`;
+    } else if (type === 'response') {
+      el.innerHTML = `<span class="aai-ws-ai-label">Web-Sight</span><span class="aai-ws-ai-text">${escHtml(text)}</span>`;
+    } else {
+      el.textContent = text;
+    }
     outputEl.appendChild(el);
     outputEl.scrollTop = outputEl.scrollHeight;
+    // Cap DOM messages
     const msgs = outputEl.querySelectorAll('.aai-ws-msg');
-    while (msgs.length > 120) msgs[0].remove();
+    while (msgs.length > 150) msgs[0].remove();
   }
 
   function highlightElement(el) {
+    if (!el) return;
     const orig = el.style.outline;
-    el.style.outline = '3px solid #60a5fa'; el.style.outlineOffset = '2px';
+    const origOffset = el.style.outlineOffset;
+    el.style.outline = '3px solid #60a5fa';
+    el.style.outlineOffset = '2px';
     el.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-    setTimeout(() => { el.style.outline = orig; el.style.outlineOffset = ''; }, 2000);
+    setTimeout(() => {
+      el.style.outline = orig;
+      el.style.outlineOffset = origOffset;
+    }, 2000);
   }
 
-  function escHtml(t) { const d = document.createElement('div'); d.textContent = t; return d.innerHTML; }
-  function wait(ms)    { return new Promise(r => setTimeout(r, ms)); }
-  function sendMessage(msg) { return new Promise(r => chrome.runtime.sendMessage(msg, r)); }
+  function escHtml(t) {
+    const d = document.createElement('div');
+    d.textContent = t;
+    return d.innerHTML;
+  }
+
+  function wait(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+  function sendMessage(msg) {
+    return new Promise(r => {
+      try {
+        chrome.runtime.sendMessage(msg, (response) => {
+          if (chrome.runtime.lastError) {
+            r({ success: false, error: chrome.runtime.lastError.message });
+          } else {
+            r(response || { success: false, error: 'No response' });
+          }
+        });
+      } catch (e) {
+        r({ success: false, error: e.message });
+      }
+    });
+  }
 
   // ─── Lifecycle ────────────────────────────────────────────
   window.addEventListener('accessai-mode-changed', (e) => {
-    if (e.detail.mode === 'web-sight') initPane();
-    else { if (isAgentActive) stopAgent(); if (hoverOverlay) hoverOverlay.style.display = 'none'; }
+    if (e.detail.mode === 'web-sight') {
+      initPane();
+    } else {
+      if (isAgentActive) stopAgent();
+      if (hoverOverlay) hoverOverlay.style.display = 'none';
+    }
   });
 
-  chrome.runtime.onMessage.addListener((msg) => {
-    if (msg.type === 'PERFORM_DOM_ACTION') executeBrowserTool(msg.action.action, msg.action);
+  chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+    if (msg.type === 'PERFORM_DOM_ACTION') {
+      executeBrowserTool(msg.action.action, msg.action).then(r => sendResponse(r)).catch(() => sendResponse({ success: false }));
+      return true;
+    }
+    if (msg.type === 'PING') {
+      sendResponse({ alive: true });
+      return;
+    }
+    if (msg.type === 'RESTORE_STATE') {
+      // Re-open sidebar and restore mode
+      if (window.__accessai?.openSidebar) window.__accessai.openSidebar();
+      if (msg.mode) {
+        setTimeout(() => {
+          window.dispatchEvent(new CustomEvent('accessai-mode-changed', { detail: { mode: msg.mode } }));
+        }, 300);
+      }
+      sendResponse({ success: true });
+      return;
+    }
+  });
+
+  // Before page unload, save reconnect state if agent is active
+  window.addEventListener('beforeunload', () => {
+    if (isAgentActive && shouldAutoReconnect) {
+      chrome.storage.local.set({ websight_should_reconnect: true });
+    }
+    saveHistory();
   });
 
   chrome.storage.local.get('activeMode', (result) => {
+    if (chrome.runtime.lastError) return;
     if (result.activeMode === 'web-sight') setTimeout(initPane, 500);
   });
 
