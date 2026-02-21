@@ -42,20 +42,20 @@ function injectScripts(tabId) {
 // ─── Message handling ────────────────────────────────────────
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   const handlers = {
-    'SET_MODE':              handleSetMode,
-    'GET_MODE':              handleGetMode,
-    'API_REQUEST':           handleApiRequest,
-    'API_REALTIME_SESSION':  handleRealtimeSession,
-    'TTS_SPEAK':             handleTtsSpeak,
-    'EXECUTE_DOM_ACTION':    handleDomAction,
-    'TOGGLE_SIDEBAR':        handleToggleSidebar,
-    'GET_API_KEY':           handleGetApiKey,
-    'WEBSIGHT_ACTIVE_STATE': handleWebSightState,
-    'WEBSIGHT_ACTIVE_STATE': handleWebSightState,
-'WEBSIGHT_NAVIGATE':     handleWebSightNavigate,
-'WEBSIGHT_OPEN_TAB':     handleWebSightOpenTab,
-'WEBSIGHT_CLOSE_TAB':    handleWebSightCloseTab,
-  };
+  'SET_MODE':              handleSetMode,
+  'GET_MODE':              handleGetMode,
+  'API_REQUEST':           handleApiRequest,
+  'API_REALTIME_SESSION':  handleRealtimeSession,
+  'TTS_SPEAK':             handleTtsSpeak,
+  'EXECUTE_DOM_ACTION':    handleDomAction,
+  'TOGGLE_SIDEBAR':        handleToggleSidebar,
+  'GET_API_KEY':           handleGetApiKey,
+  'WEBSIGHT_ACTIVE_STATE': handleWebSightState,
+  'WEBSIGHT_NAVIGATE':     handleWebSightNavigate,
+  'WEBSIGHT_OPEN_TAB':     handleWebSightOpenTab,
+  'WEBSIGHT_CLOSE_TAB':    handleWebSightCloseTab,
+  'WEBSIGHT_SWITCH_TAB':   handleWebSightSwitchTab,
+};
   const handler = handlers[message.type];
   if (handler) {
     handler(message, sender, sendResponse);
@@ -182,6 +182,49 @@ function handleWebSightOpenTab(message, sender, sendResponse) {
 function handleWebSightCloseTab(message, sender, sendResponse) {
   chrome.tabs.remove(sender.tab.id, () => {
     sendResponse({ success: !chrome.runtime.lastError });
+  });
+  return true;
+}
+
+function handleWebSightNavigate(message, sender, sendResponse) {
+  chrome.tabs.update(sender.tab.id, { url: message.url }, () => {
+    sendResponse({ success: !chrome.runtime.lastError });
+  });
+  return true;
+}
+
+function handleWebSightOpenTab(message, sender, sendResponse) {
+  chrome.tabs.create({ url: message.url }, () => {
+    sendResponse({ success: !chrome.runtime.lastError });
+  });
+  return true;
+}
+
+function handleWebSightCloseTab(message, sender, sendResponse) {
+  chrome.tabs.remove(sender.tab.id, () => {
+    sendResponse({ success: !chrome.runtime.lastError });
+  });
+  return true;
+}
+
+function handleWebSightSwitchTab(message, sender, sendResponse) {
+  const query = (message.query || '').toLowerCase();
+  chrome.tabs.query({}, tabs => {
+    // Find a tab whose title or URL contains the query
+    const match = tabs.find(t =>
+      t.title?.toLowerCase().includes(query) ||
+      t.url?.toLowerCase().includes(query)
+    );
+    if (match) {
+      // Focus the window first, then activate the tab
+      chrome.windows.update(match.windowId, { focused: true }, () => {
+        chrome.tabs.update(match.id, { active: true }, () => {
+          sendResponse({ success: true, title: match.title });
+        });
+      });
+    } else {
+      sendResponse({ success: false, error: `No tab found matching: ${query}` });
+    }
   });
   return true;
 }
