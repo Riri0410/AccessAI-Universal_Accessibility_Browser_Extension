@@ -51,12 +51,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     'TOGGLE_SIDEBAR':        handleToggleSidebar,
     'GET_API_KEY':           handleGetApiKey,
     'WEBSIGHT_ACTIVE_STATE': handleWebSightState,
+    'WEBSIGHT_ACTIVE_STATE': handleWebSightState,
+'WEBSIGHT_NAVIGATE':     handleWebSightNavigate,
+'WEBSIGHT_OPEN_TAB':     handleWebSightOpenTab,
+'WEBSIGHT_CLOSE_TAB':    handleWebSightCloseTab,
   };
   const handler = handlers[message.type];
   if (handler) {
     handler(message, sender, sendResponse);
     return true; // keep channel open for async
   }
+  
 });
 
 function handleGetApiKey(m, s, sr) { sr({ key: OPENAI_API_KEY }); }
@@ -158,6 +163,27 @@ function handleWebSightState(message, sender, sendResponse) {
     websightActiveTabs.delete(tabId);
   }
   sendResponse({ success: true });
+}
+
+function handleWebSightNavigate(message, sender, sendResponse) {
+  chrome.tabs.update(sender.tab.id, { url: message.url }, () => {
+    sendResponse({ success: !chrome.runtime.lastError });
+  });
+  return true;
+}
+
+function handleWebSightOpenTab(message, sender, sendResponse) {
+  chrome.tabs.create({ url: message.url }, () => {
+    sendResponse({ success: !chrome.runtime.lastError });
+  });
+  return true;
+}
+
+function handleWebSightCloseTab(message, sender, sendResponse) {
+  chrome.tabs.remove(sender.tab.id, () => {
+    sendResponse({ success: !chrome.runtime.lastError });
+  });
+  return true;
 }
 
 // ─── Extension icon click ─────────────────────────────────────

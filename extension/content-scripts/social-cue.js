@@ -1,23 +1,11 @@
 /**
- * Social Cue Assistant v2 - Content Script
- * Embedded natively into Google Meet's right panel
- *
- * ┌─────────────────────────────────────────────────────────────┐
- * │  AUDIO PIPELINE                                             │
- * │  getDisplayMedia (video+audio) ──┐                          │
- * │                                  ├─ AudioContext mixer      │
- * │  getUserMedia (mic) ─────────────┘   ↓                      │
- * │                              ScriptProcessor → PCM16 →      │
- * │                              base64 → OpenAI Realtime WS    │
- * ├─────────────────────────────────────────────────────────────┤
- * │  VISION PIPELINE                                            │
- * │  getDisplayMedia video track ──→ hidden <video>             │
- * │  Every 8s: drawImage to canvas → JPEG base64               │
- * │  POST /v1/chat/completions (gpt-4o) → [VISUAL] insight      │
- * ├─────────────────────────────────────────────────────────────┤
- * │  UI                                                         │
- * │  Meet layout shrunk via CSS → SCA panel injected right side │
- * └─────────────────────────────────────────────────────────────┘
+ * Social Cue Assistant v4 - Content Script
+ * - Big start CTA fills idle space, disappears on start
+ * - Compact "Stop" button pinned at top while listening
+ * - Cards fill the remaining space and scroll up as new ones arrive
+ * - Intent-based card coloring (gratitude=amber, stress=red, etc.)
+ * - Participant name detection
+ * - Noise filtering (no "Output nothing" cards)
  */
 
 (function () {
@@ -29,38 +17,30 @@
   const SAMPLE_RATE = 24000;
   const BUFFER_SIZE = 4096;
   const VISION_INTERVAL_MS = 8000;
-  const PANEL_WIDTH = 300;
 
   // ─── State ────────────────────────────────────────────────────────────────
   let ws = null;
   let audioCtx = null;
-  let displayStream = null;   // getDisplayMedia stream (video + tab audio)
-  let micStream = null;       // getUserMedia stream (mic)
+  let displayStream = null;
+  let micStream = null;
   let processorNode = null;
   let visionInterval = null;
-  let hiddenVideo = null;     // offscreen video element for frame capture
+  let hiddenVideo = null;
   let isListening = false;
-  let userName = 'User';
+  let userName = 'You';
   let apiKey = null;
   let insightCount = 0;
   let currentResponseText = '';
 
-  // ─── Inject panel into Meet's layout ─────────────────────────────────────
+  // ─── Inject panel ─────────────────────────────────────────────────────────
   function injectPanel() {
     if (document.getElementById('sca-root')) return;
 
-    // Wait for Meet's main container
-    const meetRoot = document.querySelector('[jscontroller][data-use-native-client-navigation]')
-                  || document.querySelector('c-wiz')
-                  || document.body;
-
-    // ── Styles (injected as a <style> tag so no separate CSS file needed) ──
     const style = document.createElement('style');
     style.id = 'sca-styles';
     style.textContent = `
       @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Syne:wght@600;800&display=swap');
 
-      /* ── Root panel — lives inside AccessAI sidebar pane ── */
       #sca-root {
         position: relative;
         width: 100%;
@@ -69,6 +49,7 @@
         flex-direction: column;
         font-family: 'Syne', sans-serif;
         background: transparent;
+        overflow: hidden;
       }
 
       /* ── Header ── */
@@ -76,23 +57,15 @@
         display: flex;
         align-items: center;
         justify-content: space-between;
-        padding: 14px 16px 12px;
+        padding: 12px 14px 10px;
         border-bottom: 1px solid rgba(255,255,255,0.05);
         flex-shrink: 0;
         background: linear-gradient(180deg, rgba(124,58,237,0.08) 0%, transparent 100%);
       }
-
-      .sca-header-left {
-        display: flex;
-        align-items: center;
-        gap: 10px;
-      }
-
+      .sca-header-left { display: flex; align-items: center; gap: 10px; }
       #sca-live-dot {
-        width: 8px; height: 8px;
-        border-radius: 50%;
-        background: #374151;
-        flex-shrink: 0;
+        width: 8px; height: 8px; border-radius: 50%;
+        background: #374151; flex-shrink: 0;
         transition: background 0.3s, box-shadow 0.3s;
       }
       #sca-live-dot.audio-active {
@@ -104,158 +77,126 @@
         background: #a78bfa;
         box-shadow: 0 0 8px #a78bfa, 0 0 20px rgba(167,139,250,0.5);
       }
-
       @keyframes sca-ping {
         0%,100% { box-shadow: 0 0 6px #06b6d4, 0 0 12px rgba(6,182,212,0.3); }
         50%      { box-shadow: 0 0 12px #06b6d4, 0 0 28px rgba(6,182,212,0.6); }
       }
+      .sca-wordmark { display: flex; flex-direction: column; gap: 1px; }
+      .sca-title { font-size: 12px; font-weight: 800; letter-spacing: 0.1em; text-transform: uppercase; color: #f0ecff; }
+      .sca-subtitle { font-size: 9px; font-family: 'DM Mono', monospace; color: #4b5563; letter-spacing: 0.06em; }
 
-      .sca-wordmark {
-        display: flex; flex-direction: column; gap: 1px;
-      }
-      .sca-title {
-        font-size: 12px; font-weight: 800;
-        letter-spacing: 0.1em; text-transform: uppercase;
-        color: #f0ecff;
-      }
-      .sca-subtitle {
-        font-size: 9px; font-family: 'DM Mono', monospace;
-        color: #4b5563; letter-spacing: 0.06em;
-      }
-
-      .sca-header-actions { display: flex; gap: 6px; align-items: center; }
-
-      .sca-icon-btn {
-        width: 28px; height: 28px;
-        border-radius: 8px;
-        border: 1px solid rgba(255,255,255,0.07);
-        background: rgba(255,255,255,0.03);
-        color: #6b7280; font-size: 13px;
-        cursor: pointer; display: flex;
-        align-items: center; justify-content: center;
-        transition: all 0.18s; flex-shrink: 0;
-      }
-      .sca-icon-btn:hover {
-        background: rgba(255,255,255,0.08);
-        color: #e0d7ff;
-        border-color: rgba(124,58,237,0.4);
-      }
-      .sca-icon-btn.sca-start-btn.active {
-        background: rgba(124,58,237,0.18);
-        border-color: #7c3aed;
-        color: #c4b5fd;
-      }
-
-      /* ── Status bar ── */
-      #sca-status-bar {
-        padding: 8px 16px;
-        font-family: 'DM Mono', monospace;
-        font-size: 10px;
-        color: #374151;
-        border-bottom: 1px solid rgba(255,255,255,0.04);
+      /* ── Compact stop button — pinned at top while listening ── */
+      #sca-stop-bar {
+        display: none;
         flex-shrink: 0;
-        display: flex;
-        align-items: center;
-        gap: 6px;
-        min-height: 32px;
-        transition: color 0.3s;
+        padding: 8px 12px;
+        border-bottom: 1px solid rgba(255,255,255,0.06);
+        background: rgba(0,0,0,0.15);
+      }
+      #sca-stop-btn {
+        display: flex; align-items: center; justify-content: center; gap: 8px;
+        width: 100%; padding: 8px 14px;
+        background: rgba(239,68,68,0.12);
+        border: 1px solid rgba(239,68,68,0.35);
+        border-radius: 10px; cursor: pointer;
+        font-family: 'Syne', sans-serif; font-size: 12px; font-weight: 700;
+        color: #fca5a5; letter-spacing: 0.04em;
+        transition: all 0.2s;
+      }
+      #sca-stop-btn:hover { background: rgba(239,68,68,0.22); border-color: rgba(239,68,68,0.6); }
+
+      /* ── Listening status + waveform + badges ── */
+      #sca-listening-ui { display: none; flex-direction: column; flex-shrink: 0; }
+      #sca-status-bar {
+        padding: 6px 14px; font-family: 'DM Mono', monospace;
+        font-size: 10px; color: #374151;
+        border-bottom: 1px solid rgba(255,255,255,0.04);
+        flex-shrink: 0; display: flex; align-items: center; gap: 6px;
+        min-height: 28px; transition: color 0.3s;
       }
       #sca-status-bar.active { color: #06b6d4; }
       #sca-status-bar.error  { color: #f87171; }
-      #sca-status-bar.vision { color: #a78bfa; }
-
-      /* ── Waveform ── */
       #sca-wave {
-        display: flex; align-items: center;
-        justify-content: center; gap: 3px;
-        padding: 10px 16px 6px;
-        height: 36px; flex-shrink: 0;
+        display: flex; align-items: center; justify-content: center;
+        gap: 3px; padding: 8px 16px 4px; height: 30px; flex-shrink: 0;
       }
-      .sca-bar {
-        width: 3px; background: #1f1f2e;
-        border-radius: 2px; height: 4px;
-        transition: height 0.08s, background 0.3s;
-      }
-      #sca-wave.active .sca-bar {
-        background: #7c3aed;
-        animation: sca-wave 1.4s ease-in-out infinite;
-      }
-      .sca-bar:nth-child(1)  { animation-delay: 0s;    }
-      .sca-bar:nth-child(2)  { animation-delay: 0.1s;  }
-      .sca-bar:nth-child(3)  { animation-delay: 0.2s;  }
-      .sca-bar:nth-child(4)  { animation-delay: 0.3s;  }
-      .sca-bar:nth-child(5)  { animation-delay: 0.4s;  }
-      .sca-bar:nth-child(6)  { animation-delay: 0.3s;  }
-      .sca-bar:nth-child(7)  { animation-delay: 0.2s;  }
-      .sca-bar:nth-child(8)  { animation-delay: 0.1s;  }
-      .sca-bar:nth-child(9)  { animation-delay: 0s;    }
-
-      @keyframes sca-wave {
-        0%,100% { height: 3px; }
-        50%      { height: 18px; }
-      }
-
-      /* ── Source badges ── */
-      #sca-sources {
-        display: flex; gap: 6px; padding: 0 16px 10px;
-        flex-shrink: 0;
-      }
+      .sca-bar { width: 3px; background: #1f1f2e; border-radius: 2px; height: 4px; transition: height 0.08s, background 0.3s; }
+      #sca-wave.active .sca-bar { background: #7c3aed; animation: sca-wave-anim 1.4s ease-in-out infinite; }
+      .sca-bar:nth-child(1) { animation-delay: 0s; }
+      .sca-bar:nth-child(2) { animation-delay: 0.1s; }
+      .sca-bar:nth-child(3) { animation-delay: 0.2s; }
+      .sca-bar:nth-child(4) { animation-delay: 0.3s; }
+      .sca-bar:nth-child(5) { animation-delay: 0.4s; }
+      .sca-bar:nth-child(6) { animation-delay: 0.3s; }
+      .sca-bar:nth-child(7) { animation-delay: 0.2s; }
+      .sca-bar:nth-child(8) { animation-delay: 0.1s; }
+      .sca-bar:nth-child(9) { animation-delay: 0s; }
+      @keyframes sca-wave-anim { 0%,100% { height: 3px; } 50% { height: 16px; } }
+      #sca-sources { display: flex; gap: 6px; padding: 0 14px 8px; flex-shrink: 0; }
       .sca-badge {
-        font-family: 'DM Mono', monospace;
-        font-size: 9px; letter-spacing: 0.07em;
-        text-transform: uppercase;
-        padding: 3px 7px; border-radius: 4px;
-        border: 1px solid rgba(255,255,255,0.06);
-        color: #374151; background: rgba(255,255,255,0.02);
-        transition: all 0.3s;
+        font-family: 'DM Mono', monospace; font-size: 9px; letter-spacing: 0.07em;
+        text-transform: uppercase; padding: 3px 7px; border-radius: 4px;
+        border: 1px solid rgba(255,255,255,0.06); color: #374151;
+        background: rgba(255,255,255,0.02); transition: all 0.3s;
       }
-      .sca-badge.on {
-        border-color: rgba(6,182,212,0.4);
-        color: #06b6d4;
-        background: rgba(6,182,212,0.06);
-      }
-      .sca-badge.vision-on {
-        border-color: rgba(167,139,250,0.4);
-        color: #a78bfa;
-        background: rgba(167,139,250,0.06);
-      }
+      .sca-badge.on { border-color: rgba(6,182,212,0.4); color: #06b6d4; background: rgba(6,182,212,0.06); }
+      .sca-badge.vision-on { border-color: rgba(167,139,250,0.4); color: #a78bfa; background: rgba(167,139,250,0.06); }
 
-      /* ── Feed ── */
-      #sca-feed {
+      /* ── Big start CTA ── */
+      #sca-start-cta {
         flex: 1;
-        overflow-y: auto;
-        padding: 8px 12px 12px;
         display: flex;
         flex-direction: column;
-        gap: 8px;
-        scrollbar-width: thin;
-        scrollbar-color: rgba(124,58,237,0.3) transparent;
+        align-items: center;
+        justify-content: center;
+        gap: 12px;
+        padding: 24px 16px;
       }
+      #sca-start-btn {
+        display: flex; align-items: center; justify-content: center; gap: 10px;
+        width: 100%; padding: 16px 18px;
+        background: linear-gradient(135deg, rgba(124,58,237,0.35), rgba(6,182,212,0.25));
+        border: 1.5px solid rgba(124,58,237,0.5);
+        border-radius: 14px; cursor: pointer;
+        font-family: 'Syne', sans-serif; font-size: 15px; font-weight: 800;
+        color: #e0d7ff; letter-spacing: 0.03em;
+        box-shadow: 0 0 24px rgba(124,58,237,0.2);
+        transition: all 0.2s;
+      }
+      #sca-start-btn:hover {
+        background: linear-gradient(135deg, rgba(124,58,237,0.5), rgba(6,182,212,0.35));
+        box-shadow: 0 0 36px rgba(124,58,237,0.35);
+        transform: translateY(-1px);
+      }
+      .sca-cta-hint {
+        font-size: 10px; color: #4b5563; font-family: 'DM Mono', monospace;
+        text-align: center; line-height: 1.6; max-width: 220px;
+      }
+
+      /* ── Cards feed ── */
+      #sca-feed {
+        flex: 1; overflow-y: auto; padding: 8px 12px 12px;
+        display: none;
+        flex-direction: column; gap: 8px;
+  scroll-behavior: smooth;
+  scrollbar-width: thin; scrollbar-color: rgba(124,58,237,0.3) transparent;
+        scrollbar-width: thin; 
+      }
+      #sca-feed.visible { display: flex; }
       #sca-feed::-webkit-scrollbar { width: 3px; }
       #sca-feed::-webkit-scrollbar-thumb { background: rgba(124,58,237,0.35); border-radius: 2px; }
 
-      /* ── Empty state ── */
       .sca-empty {
-        flex: 1; display: flex;
-        flex-direction: column;
+        flex: 1; display: flex; flex-direction: column;
         align-items: center; justify-content: center;
-        color: #1f2937;
-        font-family: 'DM Mono', monospace;
-        font-size: 11px; line-height: 1.7;
-        text-align: center; padding: 20px;
-        gap: 8px;
+        color: #1f2937; font-family: 'DM Mono', monospace;
+        font-size: 11px; line-height: 1.7; text-align: center; padding: 20px; gap: 8px;
       }
-      .sca-empty-eye {
-        font-size: 28px; opacity: 0.25;
-        filter: grayscale(1);
-      }
+      .sca-empty-eye { font-size: 28px; opacity: 0.25; filter: grayscale(1); }
 
-      /* ── Insight cards ── */
+      /* ── Base card ── */
       .sca-card {
-        border-radius: 10px;
-        padding: 10px 12px;
-        position: relative;
-        overflow: hidden;
+        border-radius: 10px; padding: 10px 12px;
         animation: sca-appear 0.3s cubic-bezier(0.16,1,0.3,1);
         flex-shrink: 0;
       }
@@ -264,71 +205,108 @@
         to   { opacity:1; transform: translateX(0) scale(1); }
       }
 
-      .sca-card.emotion { background: rgba(239,68,68,0.07);   border: 1px solid rgba(239,68,68,0.15);   }
-      .sca-card.turn    { background: rgba(124,58,237,0.08);  border: 1px solid rgba(124,58,237,0.2);   }
-      .sca-card.vibe    { background: rgba(6,182,212,0.06);   border: 1px solid rgba(6,182,212,0.15);   }
-      .sca-card.visual  { background: rgba(167,139,250,0.07); border: 1px solid rgba(167,139,250,0.18); }
-      .sca-card.note    { background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.07); }
+      /* Directed to YOU — bright blue, high attention */
+      .sca-card.directed {
+        background: rgba(96,165,250,0.12);
+        border: 1px solid rgba(96,165,250,0.45);
+        box-shadow: 0 0 16px rgba(96,165,250,0.12);
+      }
+      .sca-card.directed .sca-card-tag { color: #60a5fa; font-weight: 800; }
+      .sca-card.directed .sca-card-text { color: #bfdbfe; font-weight: 600; }
+
+      /* Directed to another person — soft purple */
+      .sca-card.directed_other {
+        background: rgba(139,92,246,0.08);
+        border: 1px solid rgba(139,92,246,0.3);
+      }
+      .sca-card.directed_other .sca-card-tag { color: #a78bfa; font-weight: 700; }
+      .sca-card.directed_other .sca-card-text { color: #ddd6fe; }
+
+      /* Group invite — teal */
+      .sca-card.group {
+        background: rgba(52,211,153,0.07);
+        border: 1px solid rgba(52,211,153,0.3);
+      }
+      .sca-card.group .sca-card-tag { color: #34d399; }
+      .sca-card.group .sca-card-text { color: #a7f3d0; }
+
+      /* Gratitude — warm amber, never red */
+      .sca-card.gratitude {
+        background: rgba(251,191,36,0.07);
+        border: 1px solid rgba(251,191,36,0.3);
+      }
+      .sca-card.gratitude .sca-card-tag { color: #fbbf24; }
+      .sca-card.gratitude .sca-card-text { color: #fde68a; }
+
+      /* Stress — red, pulses 3 times */
+      .sca-card.stress {
+        background: rgba(239,68,68,0.1);
+        border: 1px solid rgba(239,68,68,0.5);
+        box-shadow: 0 0 14px rgba(239,68,68,0.15);
+        animation: sca-appear 0.3s cubic-bezier(0.16,1,0.3,1),
+                   sca-stress-pulse 2s ease-in-out 0.3s 3;
+      }
+      .sca-card.stress .sca-card-tag { color: #ef4444; font-weight: 800; }
+      .sca-card.stress .sca-card-text { color: #fca5a5; font-weight: 600; }
+      @keyframes sca-stress-pulse {
+        0%, 100% { box-shadow: 0 0 14px rgba(239,68,68,0.15); }
+        50%       { box-shadow: 0 0 28px rgba(239,68,68,0.45); }
+      }
+
+      /* Turn — soft purple */
+      .sca-card.turn {
+        background: rgba(124,58,237,0.08);
+        border: 1px solid rgba(124,58,237,0.22);
+      }
+      .sca-card.turn .sca-card-tag { color: #a78bfa; }
+      .sca-card.turn .sca-card-text { color: #ddd6fe; }
+
+      /* Vibe — cyan */
+      .sca-card.vibe {
+        background: rgba(6,182,212,0.06);
+        border: 1px solid rgba(6,182,212,0.2);
+      }
+      .sca-card.vibe .sca-card-tag { color: #22d3ee; }
+      .sca-card.vibe .sca-card-text { color: #cffafe; }
+
+      /* Visual — lavender */
+      .sca-card.visual {
+        background: rgba(167,139,250,0.07);
+        border: 1px solid rgba(167,139,250,0.2);
+      }
+      .sca-card.visual .sca-card-tag { color: #c4b5fd; }
+      .sca-card.visual .sca-card-text { color: #ede9fe; }
+
+      /* Note — neutral */
+      .sca-card.note {
+        background: rgba(255,255,255,0.03);
+        border: 1px solid rgba(255,255,255,0.07);
+      }
+      .sca-card.note .sca-card-tag { color: #6b7280; }
+      .sca-card.note .sca-card-text { color: #9ca3af; }
 
       .sca-card-tag {
-        font-size: 9px; font-weight: 600;
-        letter-spacing: 0.12em; text-transform: uppercase;
-        font-family: 'DM Mono', monospace;
-        margin-bottom: 5px;
+        font-size: 9px; font-weight: 600; letter-spacing: 0.12em;
+        text-transform: uppercase; font-family: 'DM Mono', monospace; margin-bottom: 5px;
       }
-      .emotion .sca-card-tag { color: #f87171; }
-      .turn    .sca-card-tag { color: #a78bfa; }
-      .vibe    .sca-card-tag { color: #22d3ee; }
-      .visual  .sca-card-tag { color: #c4b5fd; }
-      .note    .sca-card-tag { color: #6b7280; }
-
-      .sca-card-text {
-        font-size: 13px; font-weight: 600;
-        color: #f0ecff; line-height: 1.45;
-      }
-
-      .sca-card-meta {
-        display: flex; align-items: center;
-        gap: 6px; margin-top: 5px;
-      }
-      .sca-card-time {
-        font-family: 'DM Mono', monospace;
-        font-size: 9px; color: #2d2d3d;
-      }
-      .sca-card-source {
-        font-family: 'DM Mono', monospace;
-        font-size: 9px; color: #2d2d3d;
-      }
+      .sca-card-text { font-size: 13px; font-weight: 600; color: #f0ecff; line-height: 1.45; }
+      .sca-card-meta { display: flex; align-items: center; gap: 6px; margin-top: 5px; }
+      .sca-card-time { font-family: 'DM Mono', monospace; font-size: 9px; color: #2d2d3d; }
+      .sca-card-source { font-family: 'DM Mono', monospace; font-size: 9px; color: #2d2d3d; }
 
       /* ── Footer ── */
-      #sca-footer {
-        padding: 10px 12px;
-        border-top: 1px solid rgba(255,255,255,0.04);
-        flex-shrink: 0;
-      }
+      #sca-footer { display: none; padding: 8px 12px; border-top: 1px solid rgba(255,255,255,0.04); flex-shrink: 0; }
       #sca-clear-btn {
-        width: 100%;
-        background: transparent;
-        border: 1px solid rgba(255,255,255,0.06);
-        border-radius: 8px;
-        padding: 7px;
-        color: #2d2d3d;
-        font-family: 'DM Mono', monospace;
-        font-size: 10px; letter-spacing: 0.07em;
-        text-transform: uppercase;
-        cursor: pointer;
-        transition: all 0.2s;
+        width: 100%; background: transparent;
+        border: 1px solid rgba(255,255,255,0.06); border-radius: 8px;
+        padding: 6px; color: #2d2d3d; font-family: 'DM Mono', monospace;
+        font-size: 10px; letter-spacing: 0.07em; text-transform: uppercase;
+        cursor: pointer; transition: all 0.2s;
       }
-      #sca-clear-btn:hover {
-        border-color: rgba(239,68,68,0.3);
-        color: #f87171;
-      }
-
-      /* FAB removed — AccessAI sidebar handles panel visibility */
+      #sca-clear-btn:hover { border-color: rgba(239,68,68,0.3); color: #f87171; }
     `;
     document.head.appendChild(style);
 
-    // ── Build panel DOM ──
     const root = document.createElement('div');
     root.id = 'sca-root';
     root.innerHTML = `
@@ -340,29 +318,41 @@
             <div class="sca-subtitle">AI Coach · Meet</div>
           </div>
         </div>
-        <div class="sca-header-actions">
-          <button class="sca-icon-btn sca-start-btn" id="sca-start-btn" title="Start / Stop">🎙</button>
-          <button class="sca-icon-btn" id="sca-hide-btn" title="Hide panel">✕</button>
+      </div>
+
+      <!-- Compact stop button — pinned at top, only visible while listening -->
+      <div id="sca-stop-bar">
+        <button id="sca-stop-btn">
+          <span style="font-size:14px;">⏹</span>
+          <span>Stop</span>
+        </button>
+      </div>
+
+      <!-- Status + waveform + badges — only visible while listening -->
+      <div id="sca-listening-ui">
+        <div id="sca-status-bar">Listening…</div>
+        <div id="sca-wave">${Array(9).fill('<div class="sca-bar"></div>').join('')}</div>
+        <div id="sca-sources">
+          <span class="sca-badge" id="sca-badge-mic">🎤 Mic</span>
+          <span class="sca-badge" id="sca-badge-tab">🔊 Tab</span>
+          <span class="sca-badge vision-on" id="sca-badge-vision">👁 Vision</span>
         </div>
       </div>
 
-      <div id="sca-status-bar">Ready — click 🎙 to begin</div>
-
-      <div id="sca-wave">
-        ${Array(9).fill('<div class="sca-bar"></div>').join('')}
+      <!-- Big start CTA — fills space before listening, hidden once active -->
+      <div id="sca-start-cta">
+        <button id="sca-start-btn">
+          <span style="font-size:24px;">🎙</span>
+          <span>Tap to Start</span>
+        </button>
+        <div class="sca-cta-hint">Listens to your call · surfaces social insights · never speaks into the meeting</div>
       </div>
 
-      <div id="sca-sources">
-        <span class="sca-badge" id="sca-badge-mic">🎤 Mic</span>
-        <span class="sca-badge" id="sca-badge-tab">🔊 Tab</span>
-        <span class="sca-badge vision-on" id="sca-badge-vision">👁 Vision</span>
-      </div>
-
+      <!-- Cards feed — shown once listening starts -->
       <div id="sca-feed">
         <div class="sca-empty">
           <div class="sca-empty-eye">👁</div>
-          Observing your meeting.<br>
-          Insights appear here.
+          Insights will appear here as<br>the conversation unfolds.
         </div>
       </div>
 
@@ -371,15 +361,17 @@
       </div>
     `;
 
-    // Mount inside AccessAI sidebar pane (not as a floating overlay)
     const pane = window.__accessai?.getSidebarPane('social-cue');
-    if (pane) {
-      pane.style.padding = '0';
-      pane.style.overflow = 'hidden';
-      pane.appendChild(root);
-    } else {
-      // Fallback: standalone mode
-      root.style.cssText = 'position:fixed;top:0;right:0;width:300px;height:100vh;z-index:2147483647;background:#0c0c14;display:flex;flex-direction:column;font-family:Syne,sans-serif;';
+if (pane) {
+  pane.innerHTML = '';
+  pane.style.padding = '0';
+  pane.style.overflow = 'hidden';
+  pane.style.display = 'flex';
+  pane.style.flexDirection = 'column';
+  pane.style.height = '100%';
+  pane.appendChild(root);
+} else {
+      root.style.cssText = 'position:fixed;top:0;right:0;width:300px;height:100vh;z-index:2147483647;background:#0c0c14;display:flex;flex-direction:column;';
       document.body.appendChild(root);
     }
 
@@ -389,12 +381,10 @@
   // ─── Bind UI ──────────────────────────────────────────────────────────────
   function bindUI() {
     document.getElementById('sca-start-btn').addEventListener('click', toggleListening);
-    // Hide button: AccessAI sidebar manages its own open/close — just hide it
-    const hideBtn = document.getElementById('sca-hide-btn');
-    if (hideBtn) hideBtn.style.display = 'none';
+    document.getElementById('sca-stop-btn').addEventListener('click', toggleListening);
     document.getElementById('sca-clear-btn').addEventListener('click', () => {
       const feed = document.getElementById('sca-feed');
-      feed.innerHTML = `<div class="sca-empty"><div class="sca-empty-eye">👁</div>Observing your meeting.<br>Insights appear here.</div>`;
+      feed.innerHTML = `<div class="sca-empty"><div class="sca-empty-eye">👁</div>Insights will appear here as<br>the conversation unfolds.</div>`;
       insightCount = 0;
     });
   }
@@ -408,66 +398,56 @@
   // ─── Start everything ─────────────────────────────────────────────────────
   async function startAll() {
     apiKey = await getApiKey();
-    if (!apiKey) { setStatus('⚠ No API key — open extension popup', 'error'); return; }
+    if (!apiKey) { updateCtaHint('⚠ No API key — check extension settings'); return; }
     userName = await getUserName();
 
-    // ── 1. Screen + tab audio capture ──
-    setStatus('Select your Meet window to share…', 'active');
+    updateCtaHint('Select your Meet window to share…');
     try {
       displayStream = await navigator.mediaDevices.getDisplayMedia({
-        video: { frameRate: 5, width: 1280 },  // low framerate — we only need snapshots
-        audio: {
-          echoCancellation: false,
-          noiseSuppression: false,
-          autoGainControl: false,
-        }
+        video: { frameRate: 5, width: 1280 },
+        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
       });
     } catch (err) {
-      setStatus('Screen share cancelled or denied', 'error');
+      updateCtaHint('Screen share cancelled — tap to try again');
       return;
     }
 
-    // If user stops screenshare from browser UI
     displayStream.getVideoTracks()[0]?.addEventListener('ended', () => {
       if (isListening) stopAll();
     });
 
-    // ── 2. Mic capture ──
-    setStatus('Requesting microphone…', 'active');
+    updateCtaHint('Requesting microphone…');
     try {
       micStream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        }
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
       });
     } catch (err) {
-      setStatus('Microphone denied', 'error');
+      updateCtaHint('Microphone denied — tap to try again');
       displayStream.getTracks().forEach(t => t.stop());
       return;
     }
 
-    // ── 3. Connect OpenAI Realtime ──
-    setStatus('Connecting to OpenAI…', 'active');
+    updateCtaHint('Connecting to OpenAI…');
     try {
       await connectWebSocket();
     } catch (err) {
-      setStatus('WS connection failed', 'error');
+      updateCtaHint('Connection failed — tap to try again');
       cleanup();
       return;
     }
 
-    // ── 4. Set up audio mixer → Realtime stream ──
     setupAudioMixer();
-
-    // ── 5. Start vision loop ──
     setupVisionCapture();
 
-    // ── 6. Update UI ──
     isListening = true;
-    document.getElementById('sca-start-btn').classList.add('active');
-    document.getElementById('sca-start-btn').textContent = '⏹';
+
+    // Switch layout: hide CTA, show stop button + listening UI + feed
+    document.getElementById('sca-start-cta').style.display = 'none';
+    document.getElementById('sca-stop-bar').style.display = 'block';
+    document.getElementById('sca-listening-ui').style.display = 'flex';
+    document.getElementById('sca-feed').classList.add('visible');
+    document.getElementById('sca-footer').style.display = 'block';
+
     document.getElementById('sca-live-dot').classList.add('audio-active');
     document.getElementById('sca-wave').classList.add('active');
     document.getElementById('sca-badge-mic').classList.add('on');
@@ -480,15 +460,21 @@
     cleanup();
     isListening = false;
 
-    const startBtn = document.getElementById('sca-start-btn');
-    if (startBtn) { startBtn.classList.remove('active'); startBtn.textContent = '🎙'; }
+    // Switch layout back: show CTA, hide everything else
+    document.getElementById('sca-start-cta').style.display = 'flex';
+    document.getElementById('sca-stop-bar').style.display = 'none';
+    document.getElementById('sca-listening-ui').style.display = 'none';
+    document.getElementById('sca-feed').classList.remove('visible');
+    document.getElementById('sca-footer').style.display = 'none';
+
+    updateCtaHint('Listens to your call · surfaces social insights · never speaks into the meeting');
+
     const dot = document.getElementById('sca-live-dot');
     if (dot) dot.classList.remove('audio-active', 'vision-flash');
     const wave = document.getElementById('sca-wave');
     if (wave) wave.classList.remove('active');
     document.getElementById('sca-badge-mic')?.classList.remove('on');
     document.getElementById('sca-badge-tab')?.classList.remove('on');
-    setStatus('Stopped', '');
   }
 
   function cleanup() {
@@ -501,7 +487,20 @@
     if (hiddenVideo) { hiddenVideo.srcObject = null; hiddenVideo.remove(); hiddenVideo = null; }
   }
 
-  // ─── WebSocket (OpenAI Realtime) ──────────────────────────────────────────
+  // ─── Status helpers ───────────────────────────────────────────────────────
+  function updateCtaHint(msg) {
+    const hint = document.querySelector('.sca-cta-hint');
+    if (hint) hint.textContent = msg;
+  }
+
+  function setStatus(msg, cls) {
+    const el = document.getElementById('sca-status-bar');
+    if (!el) return;
+    el.textContent = msg;
+    el.className = cls || '';
+  }
+
+  // ─── WebSocket ────────────────────────────────────────────────────────────
   function connectWebSocket() {
     return new Promise((resolve, reject) => {
       ws = new WebSocket(
@@ -540,27 +539,45 @@
     });
   }
 
+  // ─── Audio prompt ─────────────────────────────────────────────────────────
   function buildAudioPrompt() {
     return `You are a silent Social Intelligence Coach in ${userName}'s Google Meet call.
 
-You hear ALL participants (their voices + ${userName}'s mic mixed together).
+You passively listen to ALL participants. There may be multiple people speaking.
 
-RULES:
-- Stay completely silent during normal conversation.
-- Only speak when you detect something significant: emotional shift, tension, awkward silence, crosstalk, sarcasm, disengagement, or a clear turn-taking gap.
-- Max 6 words per insight. Non-negotiable.
-- Start with ONE tag: [EMOTION], [TURN], [VIBE], or [NOTE].
-- Never name ${userName}. Never suggest what to say.
+RESPONSE FORMAT — STRICTLY FOLLOW:
+- When something significant happens: ONE line starting with a tag, max 10 words after the tag.
+- When conversation is completely normal: respond with a single hyphen: -
+- NEVER write "Output nothing", "Nothing to report", or any explanation. Just: -
+
+PARTICIPANT NAME DETECTION — CRITICAL:
+- If someone addresses a specific person by name (e.g. "Ram, what do you think?" or "Sarah, your turn"):
+  → Extract the name and use it in your response.
+  → Example: [DIRECTED] Ram — being asked for their opinion.
+  → Example: [DIRECTED] Sarah — invited to share her thoughts.
+- If that named person is ${userName}, use [DIRECTED_TO_YOU] instead.
+- If no name is mentioned but someone is clearly being singled out: [DIRECTED] Someone — being put on the spot.
+
+TAGS — choose the most accurate one:
+[DIRECTED_TO_YOU] — ${userName} is specifically being asked to respond
+[DIRECTED] — a specific named participant is being addressed (include their name)
+[GROUP_INVITE] — open floor, whole group invited to speak
+[TURN] — crosstalk, awkward silence, or turn-taking gap
+[GRATITUDE] — thanks, appreciation, or praise expressed
+[STRESS] — frustration, anger, urgency, raised voice, tension
+[VIBE] — notable mood or energy shift in the room
+[NOTE] — anything else worth flagging
 
 EXAMPLES:
-[TURN] Expectant silence — they're waiting.
-[EMOTION] Frustration creeping in.
-[VIBE] Energy dropped sharply.
-[NOTE] Two voices overlapping.
-[TURN] Natural opening to speak.
-[EMOTION] Sarcasm detected.
-
-Output nothing if conversation flows normally.`;
+[DIRECTED_TO_YOU] ${userName} — asked for opinion directly.
+[DIRECTED] Ram — opportunity to speak, question directed at him.
+[DIRECTED] Sarah — being asked to present her findings.
+[GROUP_INVITE] Open floor — anyone can jump in now.
+[STRESS] Frustration rising, voices getting sharp.
+[GRATITUDE] Appreciation expressed warmly to the team.
+[TURN] Silence after question — someone should respond.
+[VIBE] Energy lifted noticeably after that update.
+-`;
   }
 
   // ─── Handle Realtime WS messages ─────────────────────────────────────────
@@ -575,7 +592,10 @@ Output nothing if conversation flows normally.`;
       case 'response.text.done':
       case 'response.done':
         if (currentResponseText.trim()) {
-          addCard(currentResponseText.trim(), 'audio');
+          const cleaned = currentResponseText.trim();
+          const isNoise = /^[-–—]+$/.test(cleaned)
+            || /^(output nothing|nothing to report|no insight|normal conversation|nothing significant)/i.test(cleaned);
+          if (!isNoise) addCard(cleaned, 'audio');
           currentResponseText = '';
         }
         break;
@@ -593,26 +613,20 @@ Output nothing if conversation flows normally.`;
   }
 
   // ─── Audio mixer ─────────────────────────────────────────────────────────
-  // Merges tab audio + mic into one mono stream, resamples to 24kHz, sends PCM16
   function setupAudioMixer() {
     audioCtx = new AudioContext({ sampleRate: SAMPLE_RATE });
-
     const destination = audioCtx.createChannelMerger(1);
     const gainMic = audioCtx.createGain();
     const gainTab = audioCtx.createGain();
     gainMic.gain.value = 1.0;
     gainTab.gain.value = 1.0;
 
-    // Mic source
     const micSource = audioCtx.createMediaStreamSource(micStream);
     micSource.connect(gainMic);
 
-    // Tab audio source (from displayStream)
     const tabAudioTracks = displayStream.getAudioTracks();
     if (tabAudioTracks.length > 0) {
-      const tabSource = audioCtx.createMediaStreamSource(
-        new MediaStream(tabAudioTracks)
-      );
+      const tabSource = audioCtx.createMediaStreamSource(new MediaStream(tabAudioTracks));
       tabSource.connect(gainTab);
       gainTab.connect(destination, 0, 0);
     } else {
@@ -621,28 +635,23 @@ Output nothing if conversation flows normally.`;
 
     gainMic.connect(destination, 0, 0);
 
-    // ScriptProcessor reads mixed output
     processorNode = audioCtx.createScriptProcessor(BUFFER_SIZE, 1, 1);
     processorNode.onaudioprocess = (e) => {
       if (!ws || ws.readyState !== WebSocket.OPEN) return;
       const f32 = e.inputBuffer.getChannelData(0);
       const pcm = f32ToPCM16(f32);
-      ws.send(JSON.stringify({
-        type: 'input_audio_buffer.append',
-        audio: bufToBase64(pcm.buffer)
-      }));
+      ws.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: bufToBase64(pcm.buffer) }));
     };
 
     destination.connect(processorNode);
     processorNode.connect(audioCtx.destination);
   }
 
-  // ─── Vision: capture display frame → GPT-4o ──────────────────────────────
+  // ─── Vision capture ───────────────────────────────────────────────────────
   function setupVisionCapture() {
     const videoTrack = displayStream.getVideoTracks()[0];
     if (!videoTrack) return;
 
-    // Create a hidden video element to render the display stream
     hiddenVideo = document.createElement('video');
     hiddenVideo.style.cssText = 'position:fixed;top:-9999px;left:-9999px;width:1px;height:1px;opacity:0;pointer-events:none;';
     hiddenVideo.autoplay = true;
@@ -652,7 +661,6 @@ Output nothing if conversation flows normally.`;
     document.body.appendChild(hiddenVideo);
     hiddenVideo.play().catch(() => {});
 
-    // Fire immediately after a short delay, then every VISION_INTERVAL_MS
     setTimeout(() => {
       captureAndAnalyse();
       visionInterval = setInterval(captureAndAnalyse, VISION_INTERVAL_MS);
@@ -663,17 +671,15 @@ Output nothing if conversation flows normally.`;
     if (!hiddenVideo || hiddenVideo.readyState < 2) return;
     if (!apiKey) return;
 
-    // Draw current video frame to canvas
-    const W = 1280, H = Math.round(1280 * (hiddenVideo.videoHeight / (hiddenVideo.videoWidth || 1280)));
+    const W = 1280;
+    const H = Math.round(1280 * (hiddenVideo.videoHeight / (hiddenVideo.videoWidth || 1280)));
     const canvas = document.createElement('canvas');
     canvas.width = W || 1280;
     canvas.height = H || 720;
     const ctx2d = canvas.getContext('2d');
     ctx2d.drawImage(hiddenVideo, 0, 0, canvas.width, canvas.height);
-    const jpeg = canvas.toDataURL('image/jpeg', 0.55);
-    const base64 = jpeg.split(',')[1];
+    const base64 = canvas.toDataURL('image/jpeg', 0.55).split(',')[1];
 
-    // Flash vision indicator
     const dot = document.getElementById('sca-live-dot');
     if (dot) {
       dot.classList.remove('audio-active');
@@ -684,14 +690,10 @@ Output nothing if conversation flows normally.`;
       }, 600);
     }
 
-    // Send to GPT-4o Vision
     try {
       const res = await fetch('https://api.openai.com/v1/chat/completions', {
         method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${apiKey}`,
-          'Content-Type': 'application/json',
-        },
+        headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({
           model: VISION_MODEL,
           max_tokens: 60,
@@ -700,24 +702,21 @@ Output nothing if conversation flows normally.`;
             content: [
               {
                 type: 'text',
-                text: `You are observing ${userName}'s Google Meet call. This is a screenshot of the full meeting window showing all participants and any screenshare.
+                text: `You are observing ${userName}'s Google Meet call screenshot.
 
-Describe ONLY significant social/visual cues you see. Examples:
+Describe ONLY significant social/visual cues:
 - Someone looks disengaged or distracted
-- Visible frustration or confusion on faces  
-- Screenshare showing key content worth noting
+- Visible frustration or confusion on faces
 - Someone has their hand raised or is trying to speak
 - Significant body language shift
 
-If everything looks normal, respond with exactly: NONE
+If everything looks normal, respond with a single hyphen: -
+Never write "Output nothing", "NONE", or any explanation.
 
 Otherwise respond with ONE insight, max 7 words, starting with [VISUAL].
 Example: [VISUAL] Someone appears confused or zoned out.`
               },
-              {
-                type: 'image_url',
-                image_url: { url: `data:image/jpeg;base64,${base64}`, detail: 'low' }
-              }
+              { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${base64}`, detail: 'low' } }
             ]
           }]
         })
@@ -725,9 +724,11 @@ Example: [VISUAL] Someone appears confused or zoned out.`
 
       const json = await res.json();
       const text = json.choices?.[0]?.message?.content?.trim();
-      if (text && text !== 'NONE' && text.length > 0) {
-        addCard(text, 'vision');
-      }
+      const isNoise = !text
+        || /^[-–—]+$/.test(text)
+        || text === 'NONE'
+        || /^(output nothing|nothing to report|no insight|normal)/i.test(text);
+      if (!isNoise) addCard(text, 'vision');
       setStatus(`${insightCount} insight${insightCount !== 1 ? 's' : ''} captured`, 'active');
     } catch (err) {
       console.error('[SCA Vision]', err);
@@ -739,22 +740,28 @@ Example: [VISUAL] Someone appears confused or zoned out.`
     const feed = document.getElementById('sca-feed');
     if (!feed) return;
 
-    // Remove empty state
     feed.querySelector('.sca-empty')?.remove();
 
-    // Parse tag
     let type = 'note', tag = 'Note', body = text;
-    const tagMatch = text.match(/^\[(EMOTION|TURN|VIBE|NOTE|VISUAL)\]\s*/i);
+    const tagMatch = text.match(/^\[(DIRECTED_TO_YOU|DIRECTED|GROUP_INVITE|GRATITUDE|STRESS|TURN|VIBE|NOTE|VISUAL|EMOTION)\]\s*/i);
+
     if (tagMatch) {
       const t = tagMatch[1].toUpperCase();
       body = text.slice(tagMatch[0].length).trim();
-      if (t === 'EMOTION') { type = 'emotion'; tag = 'Emotion'; }
-      else if (t === 'TURN')    { type = 'turn';    tag = 'Turn';    }
-      else if (t === 'VIBE')    { type = 'vibe';    tag = 'Vibe';    }
-      else if (t === 'VISUAL')  { type = 'visual';  tag = 'Visual';  }
-      else                      { type = 'note';    tag = 'Note';    }
+      switch (t) {
+        case 'DIRECTED_TO_YOU': type = 'directed';       tag = '🎯 You — Speak Up!'; break;
+        case 'DIRECTED':        type = 'directed_other'; tag = '🎯 Directed';         break;
+        case 'GROUP_INVITE':    type = 'group';           tag = '🙋 Group Invite';    break;
+        case 'GRATITUDE':       type = 'gratitude';       tag = '🙏 Gratitude';       break;
+        case 'STRESS':          type = 'stress';          tag = '⚠️ Stress';          break;
+        case 'TURN':            type = 'turn';            tag = '↩ Turn';             break;
+        case 'VIBE':            type = 'vibe';            tag = '〜 Vibe';            break;
+        case 'VISUAL':          type = 'visual';          tag = '👁 Visual';          break;
+        case 'EMOTION':         type = 'turn';            tag = '↩ Turn';             break;
+        default:                type = 'note';            tag = '· Note';             break;
+      }
     } else if (source === 'vision') {
-      type = 'visual'; tag = 'Visual';
+      type = 'visual'; tag = '👁 Visual';
     }
 
     const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
@@ -772,23 +779,24 @@ Example: [VISUAL] Someone appears confused or zoned out.`
       </div>
     `;
 
-    feed.insertBefore(card, feed.firstChild);
+    feed.appendChild(card);
+card.scrollIntoView({ behavior: 'smooth', block: 'end' });
+const all = feed.querySelectorAll('.sca-card');
+if (all.length > 30) all[0].remove();
 
-    // Cap history at 30
-    const all = feed.querySelectorAll('.sca-card');
-    if (all.length > 30) all[all.length - 1].remove();
+    // Flash dot for urgent types
+    if (type === 'directed' || type === 'directed_other' || type === 'stress') {
+      const dot = document.getElementById('sca-live-dot');
+      if (dot) {
+        dot.classList.add('vision-flash');
+        setTimeout(() => { if (isListening) dot.classList.remove('vision-flash'); }, 1200);
+      }
+    }
 
     setStatus(`${insightCount} insight${insightCount !== 1 ? 's' : ''} captured`, 'active');
   }
 
   // ─── Helpers ──────────────────────────────────────────────────────────────
-  function setStatus(msg, cls) {
-    const el = document.getElementById('sca-status-bar');
-    if (!el) return;
-    el.textContent = msg;
-    el.className = cls ? `${cls}` : '';
-  }
-
   function esc(s) {
     return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
   }
@@ -817,11 +825,9 @@ Example: [VISUAL] Someone appears confused or zoned out.`
     return Promise.resolve('You');
   }
 
-  // ─── Boot: wait for Meet to load ─────────────────────────────────────────
+  // ─── Boot ─────────────────────────────────────────────────────────────────
   function boot() {
-    // Meet loads its UI dynamically; wait for the main video container
     const check = () => {
-      // Meet is ready when it has its main layout element
       const ready = document.querySelector('[data-call-ended]') !== undefined
                  || document.querySelector('c-wiz')
                  || document.querySelector('[jscontroller]');
@@ -838,7 +844,7 @@ Example: [VISUAL] Someone appears confused or zoned out.`
     }
   }
 
-  // ─── AccessAI lifecycle integration ──────────────────────────────────────
+  // ─── AccessAI lifecycle ───────────────────────────────────────────────────
   let panelBooted = false;
   function maybeBootPanel() {
     if (panelBooted) return;
