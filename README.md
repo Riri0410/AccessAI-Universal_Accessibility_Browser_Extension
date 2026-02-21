@@ -1,16 +1,16 @@
 # AccessAI — Universal Accessibility Browser Extension
 
-An AI-powered Chrome extension providing three real-time voice accessibility tools backed by OpenAI's GPT-4o and Realtime API.
+An AI-powered Chrome extension providing three real-time intelligent tools built on OpenAI's GPT-4o, Whisper, Realtime API, and TTS — all surfaced through a unified sidebar that works on any website.
 
 ---
 
-## Features
+## Modes at a Glance
 
-| Mode | Description |
+| Mode | What it does |
 |------|-------------|
-| **Social Cue Coach** | Passive observer that whispers real-time social intelligence during meetings and conversations |
-| **Web-Sight Navigator** | Voice-controlled agentic browser automation for hands-free browsing |
-| **ClearContext Buddy** | Live lecture assistant that extracts jargon, defines terms, and builds a concept map |
+| **Social Cue Coach** | Passively observes live conversations and whispers real-time social intelligence |
+| **Web-Sight Navigator** | Voice-controlled agentic browser automation — speak a goal, AI handles the clicks |
+| **ClearContext** | Watches your screen + listens to your lecture/video and auto-builds AI knowledge cards |
 
 ---
 
@@ -18,23 +18,23 @@ An AI-powered Chrome extension providing three real-time voice accessibility too
 
 ```
 BrowserExtension/
-├── extension/                    # Chrome Extension (Manifest v3)
+├── extension/                     # Chrome Extension (Manifest v3)
 │   ├── manifest.json
-│   ├── background.js             # Service worker & API gateway
+│   ├── background.js              # Service worker & API gateway
 │   ├── content-scripts/
-│   │   ├── sidebar.js            # Unified sidebar UI shell
-│   │   ├── social-cue.js         # Social Cue Coach
-│   │   ├── web-sight.js          # Web-Sight Navigator
-│   │   └── clear-context.js      # ClearContext Education Buddy
+│   │   ├── sidebar.js             # Unified sidebar UI shell
+│   │   ├── social-cue.js          # Social Cue Coach
+│   │   ├── web-sight.js           # Web-Sight Navigator
+│   │   └── clear-context.js       # ClearContext v5 — Intelligent Card Engine
 │   ├── styles/
 │   │   └── sidebar.css
 │   └── icons/
-├── proxy-server/                 # [Optional] Secure Node.js proxy
+├── proxy-server/                  # Optional secure Node.js API proxy
 │   ├── server.js
 │   ├── package.json
 │   ├── .env.example
 │   └── .gitignore
-└── generate-icons.js             # Icon generation utility
+└── generate-icons.js              # Icon generation utility
 ```
 
 ---
@@ -42,20 +42,20 @@ BrowserExtension/
 ## Prerequisites
 
 - Google Chrome (or any Chromium-based browser)
-- An [OpenAI API key](https://platform.openai.com/api-keys) with access to GPT-4o and the Realtime API
+- An [OpenAI API key](https://platform.openai.com/api-keys) with access to GPT-4o, Whisper, TTS, and the Realtime API
 - Node.js 14+ _(only required if using the optional proxy server)_
 
 ---
 
 ## Quick Start (Direct API Key Mode)
 
-This is the simplest setup — the API key lives inside the extension itself.
+The simplest setup — your API key lives inside the extension itself.
 
 > **Note:** This embeds your key in browser memory. Use the proxy server for a more secure setup.
 
 ### 1. Add your API key
 
-Open `extension/background.js` and set your key on line 4:
+Open `extension/background.js` and set your key:
 
 ```js
 const OPENAI_API_KEY = 'sk-your-key-here';
@@ -63,22 +63,21 @@ const OPENAI_API_KEY = 'sk-your-key-here';
 
 ### 2. Load the extension
 
-1. Open Chrome and navigate to `chrome://extensions/`
+1. Navigate to `chrome://extensions/`
 2. Enable **Developer mode** (toggle, top-right)
-3. Click **Load unpacked**
-4. Select the `extension/` folder
+3. Click **Load unpacked** and select the `extension/` folder
 
 ### 3. Use the extension
 
-- Click the AccessAI icon in the toolbar **or** press `Alt+A` on any page
-- Switch between the three modes using the tab bar in the sidebar
+- Click the AccessAI toolbar icon **or** press `Alt+A` on any page
+- Switch between modes using the tab bar in the sidebar
 - Click the animated orb in any mode to start a session
 
 ---
 
 ## Optional: Proxy Server (Recommended for Production)
 
-The proxy server keeps your OpenAI API key on a backend instead of inside the extension. It also adds rate limiting and enforces CORS restrictions.
+The proxy server keeps your OpenAI API key on a backend. It also adds rate limiting and CORS enforcement.
 
 ### 1. Install dependencies
 
@@ -101,7 +100,7 @@ PORT=3001
 ALLOWED_ORIGINS=chrome-extension://your-extension-id-here
 ```
 
-To find your extension ID, go to `chrome://extensions/` after loading the extension.
+Find your extension ID at `chrome://extensions/` after loading.
 
 ### 3. Start the server
 
@@ -109,66 +108,205 @@ To find your extension ID, go to `chrome://extensions/` after loading the extens
 npm start
 ```
 
-Expected output:
-
 ```
 AccessAI proxy running on port 3001
 HTTP:      http://localhost:3001
 WebSocket: ws://localhost:3001/api/realtime
 ```
 
-Verify it's running:
+Verify:
 
 ```bash
 curl http://localhost:3001/health
 # {"status":"healthy"}
 ```
 
-### 4. Point the extension to the proxy
+### 4. Point the extension at the proxy
 
-Update `extension/background.js` to route requests through your proxy URL instead of calling OpenAI directly. Leave `OPENAI_API_KEY` empty and update the endpoint constants to point at `http://localhost:3001/api/openai` (HTTP) and `ws://localhost:3001/api/realtime` (WebSocket).
+Update `extension/background.js` to route requests through `http://localhost:3001/api/openai` (HTTP) and `ws://localhost:3001/api/realtime` (WebSocket), leaving `OPENAI_API_KEY` empty in the extension file.
 
 ### Production deployment
 
-Deploy `proxy-server/` to any Node.js host (Render, Railway, Fly.io, etc.). Set environment variables on the platform and update endpoint constants in the extension to use your deployed URL with `https://` and `wss://`.
+Deploy `proxy-server/` to any Node.js host (Render, Railway, Fly.io, etc.). Set environment variables on the platform and update the endpoint constants in the extension to use `https://` and `wss://` URLs.
 
 ---
 
-## Extension Modes
+## Extension Modes — Detailed
+
+---
 
 ### Social Cue Coach
 
-Passively listens to live audio and surfaces brief insights about social dynamics.
+A silent observer that surfaces real-time social intelligence during conversations and meetings.
 
+**How it works:**
 - Connects to the OpenAI Realtime API via WebSocket
-- Outputs 3–7 word insights tagged as `Insight:`, `Action:`, or `Vibe:`
-- Insights are spoken quietly via Chrome's TTS API and displayed in a live feed
-- Does not participate in the conversation — observation only
+- Passively listens to live audio without participating in the conversation
+- Generates brief 3–7 word insights tagged as one of three types:
+  - `Insight:` — observations about group dynamics or subtext
+  - `Action:` — suggested next moves for the user
+  - `Vibe:` — overall emotional temperature of the conversation
+- Insights are spoken quietly via Chrome's native TTS and shown in a live feed panel
+
+**Key behaviours:**
+- Observation only — does not speak into the conversation
+- Continuous session until manually stopped
+- Low-latency responses via the Realtime WebSocket
+
+---
 
 ### Web-Sight Navigator
 
-Hands-free, voice-controlled browser agent using GPT-4o function calling.
+A hands-free, voice-controlled browser agent powered by GPT-4o function calling and semantic page understanding.
 
-- Speak a command; the agent plans and executes a multi-step sequence (up to 12 steps)
-- Available browser actions: click, type, scroll, navigate, read page, find elements, press key, select dropdown
-- Purchase safety guard: actions containing "buy", "checkout", or "pay" require explicit voice confirmation
+**How it works:**
+- Speak a natural language goal (e.g. "Find machine learning courses on this site")
+- GPT-4o plans a multi-step sequence of browser actions to fulfil the goal
+- Executes up to 18 steps autonomously, re-reading the page between steps
 - Falls back to typed commands if voice input is unavailable
 
-### ClearContext Education Buddy
+**Available browser actions:**
 
-Real-time lecture companion that listens continuously and builds a personal glossary.
+| Action | What it does |
+|--------|-------------|
+| `click` | Clicks any element by CSS selector |
+| `type` | Types text into an input field |
+| `navigate` | Goes to a URL |
+| `scroll` | Scrolls the page or an element |
+| `read_page` | Reads visible text content (3000 char limit) |
+| `find_elements` | Finds elements matching a description |
+| `press_key` | Presses a keyboard key |
+| `select_option` | Selects a dropdown option |
 
-- Extracts terms and definitions from what you hear and shows them as cards
-- Builds a canvas-based concept map linking terms by category
-- Three sub-tabs: **Terms** (glossary cards), **Concept Map** (visual graph), **Live Feed** (transcript)
-- Tap any term card to hear its definition again via TTS
-- Falls back to typed questions via GPT-4o Chat Completions if the WebSocket closes
+**Semantic search intelligence:**
+- Before searching, the agent reads the page and navigation to understand the site's own vocabulary
+- Never types literal user words into a search on a specialised site — it maps the intent to the site's taxonomy (e.g. user says "business courses", site calls it "Business Administration", agent searches the site's term)
+- Prefers clicking nav links over searching when possible
+
+**Safety:**
+- Actions containing "buy", "checkout", or "pay" require explicit voice confirmation before proceeding
+
+---
+
+### ClearContext — Intelligent Topic Card Engine
+
+ClearContext watches your screen and listens to your lecture or video, then uses AI to automatically build structured, markdown-rich knowledge cards organised into named workspaces.
+
+**Pipeline:**
+1. You share your screen or a browser tab — both audio and video are captured
+2. Audio is split into 8-second chunks and transcribed by **OpenAI Whisper**
+3. Every 3 transcripts, **GPT-4o Vision** analyses the rolling transcript *alongside a live screenshot* of your screen
+4. AI decides whether to create a new card, update an existing one, or skip
+5. Cards are immediately saved to Chrome storage under your workspace name
+
+**No microphone required** — only system/tab audio is used.
+
+---
+
+#### Workspace Management
+
+- **Named workspaces** — give each session a name (e.g. `CS101`, `CrewAI Deep Dive`) before starting; all cards are saved under that name
+- **Workspace dropdown** — a dropdown on the hero screen lists all previously saved workspaces; select any to resume it instantly
+- **New workspace input** — selecting "＋ New workspace…" shows a text field; the Start button stays disabled until a name is entered (prevents accidental unnamed sessions)
+- **Persistent storage** — workspaces and all cards survive page reloads and browser restarts via `chrome.storage.local`
+
+---
+
+#### Live Tab
+
+- **Real-time transcript stream** — every Whisper-transcribed chunk appears timestamped as it arrives
+- **Processing indicators** — animated status lines show `⟳ Transcribing…` and `🧠 AI analysing content…` as they happen
+- **Vision confirmation** — on session start, the Live tab confirms whether screenshot capture is active
+
+---
+
+#### AI Card Engine
+
+Cards are generated by GPT-4o with a screen screenshot attached to every analysis call — not just audio.
+
+| AI decision | When it happens |
+|-------------|----------------|
+| **New card** | A new concept, tool, library, person, or project is introduced |
+| **Code card** | Code is visible on screen — extracted verbatim with a fenced code block and explanation |
+| **Table card** | A data schema or table is visible — rendered as a markdown table |
+| **Update card** | More detail emerges about the exact same topic as an existing card — content is merged |
+| **Skip** | Filler, repeated content, or nothing new — no card created |
+
+**Multi-card philosophy:** multiple focused cards are always better than one bloated card. The AI creates a separate card for each distinct topic, example, or code snippet it sees — it never forces everything into one card.
+
+**Vision-corrected names:** if Whisper mishears a brand or product name (e.g. "CREO AI" for "CrewAI"), the screenshot overrides the audio — on-screen text always wins.
+
+---
+
+#### Cards Tab
+
+- **In-tab workspace browser** — a small dropdown inside the Cards tab lets you switch between saved workspaces to browse their cards freely, even mid-recording
+- **Live lock badge** — while recording, a `🔴 Live` badge appears next to the Cards dropdown; switching the display workspace **does not** stop or affect the active recording
+- **Animated card entrance** — new cards pop in with a smooth scale-up animation
+- **Update highlight** — updated cards flash with a brighter border for 2.5 s to signal new content
+- **Card count badge** — the Cards tab label shows a live count
+
+---
+
+#### Card Content Rendering (built-in, no external libraries)
+
+| Syntax | Rendered as |
+|--------|------------|
+| `**bold**` | **bold** |
+| `*italic*` | *italic* |
+| `` `code` `` | inline code block |
+| `## Heading` | section heading |
+| `### Subheading` | sub-section heading |
+| `- bullet` | bullet list item |
+| `1. numbered` | numbered list item |
+| ` ```python ... ``` ` | dark scrollable `<pre>` block with coloured text |
+| `\| col \| col \|` tables | styled HTML table with coloured header |
+
+---
+
+#### Per-Card Actions
+
+Each card has three action buttons:
+
+| Button | What it does |
+|--------|-------------|
+| **▶ Play** | Calls OpenAI TTS (`tts-1`, alloy voice) and plays the card aloud in-browser. Markdown/code syntax is stripped before speech so it reads naturally. Clicking again stops playback. |
+| **⬇ .md** | Downloads the card as a `.md` Markdown file |
+| **⬇ .mp3** | Generates TTS audio via OpenAI and downloads it as an `.mp3` file |
+
+---
+
+#### Chat Tab
+
+- **Card-grounded answers** — the AI primarily answers from your saved cards
+- **Supplemental knowledge** — when the cards don't fully cover a question, the AI can draw on its general knowledge and clearly flags it (`"Beyond what's in your notes…"`)
+- **Works without recording** — chat fetches an API key on demand, so it works even when not actively listening
+- **Send button + Enter key** — both submit the message
+
+---
+
+#### Browse Mode
+
+- **No recording required** — click **Browse Cards** on the hero screen to load any saved workspace read-only, without capturing audio or video
+- **Read-only indicator** — a "browse mode" strip is shown at the top of the panel
+- **Back button** — the Stop button becomes "← Back" to return to the workspace picker
+
+---
+
+#### AI Models Used by ClearContext
+
+| Task | Model |
+|------|-------|
+| Audio transcription | `whisper-1` |
+| Card analysis (text + screenshot) | `gpt-4o` (vision) |
+| Chat assistant | `gpt-4o` |
+| Text-to-speech (play + download) | `tts-1` — alloy voice |
 
 ---
 
 ## Icon Generation
 
-To regenerate the extension icons (16×16, 48×48, 128×128):
+To regenerate extension icons (16×16, 48×48, 128×128):
 
 ```bash
 node generate-icons.js
@@ -180,15 +318,13 @@ Icons are written to `extension/icons/`.
 
 ## Permissions
 
-The extension requests the following Chrome permissions:
-
 | Permission | Reason |
 |------------|--------|
 | `activeTab` | Access the current tab's DOM for Web-Sight actions |
-| `storage` | Persist sidebar state and active mode across page loads |
+| `storage` | Persist workspaces, cards, sidebar state, and active mode |
 | `scripting` | Inject content scripts into already-open tabs on install |
-| `tts` | Speak AI responses using Chrome's native text-to-speech |
-| `https://api.openai.com/*` | Direct OpenAI API access (only used without proxy) |
+| `tts` | Speak Social Cue insights via Chrome's native TTS |
+| `https://api.openai.com/*` | Direct OpenAI API access (used without proxy) |
 | `https://*/*`, `http://*/*` | Run the sidebar on any website |
 
 ---
@@ -209,11 +345,16 @@ The extension requests the following Chrome permissions:
 |-----|------|-------------|
 | `activeMode` | string | Currently selected mode (`social-cue`, `web-sight`, `clear-context`) |
 | `sidebarOpen` | boolean | Whether the sidebar is visible |
+| `cc_workspace_list` | string[] | Ordered list of all saved ClearContext workspace names |
+| `cc_ws_<name>` | Card[] | Array of cards saved for a given workspace |
 
 ---
 
 ## Security Notes
 
-- **Direct mode**: The API key is stored in `background.js` and accessible in browser memory. Suitable for personal/development use only.
-- **Proxy mode**: The API key never leaves the server. The proxy enforces rate limiting (60 req/min per IP) and CORS allowlisting. Recommended for any shared or production deployment.
-- Never commit a real API key to version control. The `proxy-server/.env` file is already git-ignored.
+- **Direct mode:** The API key is stored in `background.js` and accessible in browser memory. Suitable for personal/development use only.
+- **Proxy mode:** The API key never leaves the server. The proxy enforces rate limiting (60 req/min per IP) and CORS allowlisting. Recommended for any shared or production deployment.
+- Never commit a real API key to version control. `proxy-server/.env` is already git-ignored.
+
+
+---
