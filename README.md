@@ -2,14 +2,6 @@
 
 An AI-powered Chrome extension providing three real-time intelligent tools built on OpenAI's GPT-4o, Whisper, Realtime API, and TTS — all surfaced through a unified sidebar that works on any website.
 
-<p align="center">
-  <img src="images/Social%20Cue.png" width="30%" alt="Social Cue" />
-  &nbsp;
-  <img src="images/Web%20Sight.png" width="30%" alt="Web Sight" />
-  &nbsp;
-  <img src="images/Clear%20Context.png" width="30%" alt="Clear Context" />
-</p>
-
 ---
 
 # AccessAI — Quick Setup
@@ -111,6 +103,14 @@ The solution is also highly generalisable across contexts. Its DOM-aware approac
 | **Social Cue Coach** | Passively observes live conversations and whispers real-time social intelligence |
 | **Web-Sight Navigator** | Voice-controlled agentic browser automation — speak a goal, AI handles the clicks |
 | **ClearContext** | Watches your screen + listens to your lecture/video and auto-builds AI knowledge cards |
+
+<p align="center">
+  <img src="images/Social%20Cue.png" width="30%" alt="Social Cue" />
+  &nbsp;
+  <img src="images/Web%20Sight.png" width="30%" alt="Web Sight" />
+  &nbsp;
+  <img src="images/Clear%20Context.png" width="30%" alt="Clear Context" />
+</p>
 
 ---
 
