@@ -29,11 +29,6 @@ BrowserExtension/
 │   ├── styles/
 │   │   └── sidebar.css
 │   └── icons/
-├── proxy-server/                  # Optional secure Node.js API proxy
-│   ├── server.js
-│   ├── package.json
-│   ├── .env.example
-│   └── .gitignore
 └── generate-icons.js              # Icon generation utility
 ```
 
@@ -43,7 +38,7 @@ BrowserExtension/
 
 - Google Chrome (or any Chromium-based browser)
 - An [OpenAI API key](https://platform.openai.com/api-keys) with access to GPT-4o, Whisper, TTS, and the Realtime API
-- Node.js 14+ _(only required if using the optional proxy server)_
+- Node.js 14+ _(only required if you plan to run local tooling such as the icon generator)_
 
 ---
 
@@ -51,7 +46,7 @@ BrowserExtension/
 
 The simplest setup — your API key lives inside the extension itself.
 
-> **Note:** This embeds your key in browser memory. Use the proxy server for a more secure setup.
+> **Note:** This embeds your key in browser memory. Do not commit real keys to version control.
 
 ### 1. Add your API key
 
@@ -72,62 +67,6 @@ const OPENAI_API_KEY = 'sk-your-key-here';
 - Click the AccessAI toolbar icon **or** press `Alt+A` on any page
 - Switch between modes using the tab bar in the sidebar
 - Click the animated orb in any mode to start a session
-
----
-
-## Optional: Proxy Server (Recommended for Production)
-
-The proxy server keeps your OpenAI API key on a backend. It also adds rate limiting and CORS enforcement.
-
-### 1. Install dependencies
-
-```bash
-cd proxy-server
-npm install
-```
-
-### 2. Configure environment
-
-```bash
-cp .env.example .env
-```
-
-Edit `.env`:
-
-```env
-OPENAI_API_KEY=sk-your-key-here
-PORT=3001
-ALLOWED_ORIGINS=chrome-extension://your-extension-id-here
-```
-
-Find your extension ID at `chrome://extensions/` after loading.
-
-### 3. Start the server
-
-```bash
-npm start
-```
-
-```
-AccessAI proxy running on port 3001
-HTTP:      http://localhost:3001
-WebSocket: ws://localhost:3001/api/realtime
-```
-
-Verify:
-
-```bash
-curl http://localhost:3001/health
-# {"status":"healthy"}
-```
-
-### 4. Point the extension at the proxy
-
-Update `extension/background.js` to route requests through `http://localhost:3001/api/openai` (HTTP) and `ws://localhost:3001/api/realtime` (WebSocket), leaving `OPENAI_API_KEY` empty in the extension file.
-
-### Production deployment
-
-Deploy `proxy-server/` to any Node.js host (Render, Railway, Fly.io, etc.). Set environment variables on the platform and update the endpoint constants in the extension to use `https://` and `wss://` URLs.
 
 ---
 
@@ -279,7 +218,7 @@ Each card has three action buttons:
 #### Chat Tab
 
 - **Card-grounded answers** — the AI primarily answers from your saved cards
-- **Supplemental knowledge** — when the cards don't fully cover a question, the AI can draw on its general knowledge and clearly flags it (`"Beyond what's in your notes…"`)
+- **Supplemental knowledge** — when the cards don't fully cover a question, the AI can draw on its general knowledge and clearly flags it ("Beyond what's in your notes…")
 - **Works without recording** — chat fetches an API key on demand, so it works even when not actively listening
 - **Send button + Enter key** — both submit the message
 
@@ -324,20 +263,10 @@ Icons are written to `extension/icons/`.
 | `storage` | Persist workspaces, cards, sidebar state, and active mode |
 | `scripting` | Inject content scripts into already-open tabs on install |
 | `tts` | Speak Social Cue insights via Chrome's native TTS |
-| `https://api.openai.com/*` | Direct OpenAI API access (used without proxy) |
+| `https://api.openai.com/*` | Direct OpenAI API access |
 | `https://*/*`, `http://*/*` | Run the sidebar on any website |
 
 ---
-
-## Configuration Reference
-
-### Proxy Server (`proxy-server/.env`)
-
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `OPENAI_API_KEY` | Yes | — | OpenAI secret key |
-| `PORT` | No | `3001` | Server port |
-| `ALLOWED_ORIGINS` | No | — | Comma-separated extra CORS origins |
 
 ### Extension (`chrome.storage.local`)
 
@@ -353,8 +282,77 @@ Icons are written to `extension/icons/`.
 ## Security Notes
 
 - **Direct mode:** The API key is stored in `background.js` and accessible in browser memory. Suitable for personal/development use only.
-- **Proxy mode:** The API key never leaves the server. The proxy enforces rate limiting (60 req/min per IP) and CORS allowlisting. Recommended for any shared or production deployment.
-- Never commit a real API key to version control. `proxy-server/.env` is already git-ignored.
+- Never commit a real API key to version control.
 
+---
+
+## Problem statement
+
+Many modern websites remain difficult to perceive, understand, and navigate for people with sensory, cognitive, or motor impairments. Complex layouts, visually dense content, ambiguous icons, and multi-step interactions often limit independent access to online information and services.
+
+AccessAI addresses these challenges by functioning as an on-page accessibility assistant embedded directly within the browser. It targets three core issues: (1) difficulty locating relevant information on content-heavy or poorly structured pages, (2) challenges in interpreting visual or social cues such as images, icons, or interface states, and (3) barriers to completing multi-step interactions caused by limited fine motor control or cognitive overload.
+
+AccessAI improves accessibility through features such as text-to-speech, content summarisation, and DOM-based highlighting. It enhances cognitive accessibility by simplifying language, and explaining interface elements. By combining multimodal interaction with contextual understanding of web pages, AccessAI enables more inclusive and independent web access for users with diverse abilities.
+
+---
+
+## Motivation
+
+Many websites remain difficult to perceive, understand, and navigate for people with sensory, cognitive, or motor impairments. While existing assistive technologies such as screen readers, browser zoom, and built-in accessibility tools provide essential support, they often struggle with complex modern web pages and offer limited contextual or task-level guidance.
+
+This project is motivated by the need for a lightweight, page-integrated accessibility assistant that complements existing tools rather than replacing them. By combining DOM-aware techniques with AI-assisted summarisation and interpretation, the system makes intent, ambiguity or social content more immediately accessible.
+
+The key motivations are to empower users to complete common tasks such as reading content, following links, or filling forms independently to:
+(i) reduce cognitive load;
+(ii) interpret visual or social cues that may otherwise be missed; and 
+(iii) provide multimodal interaction with users.
+
+A browser extension is chosen as a practical solution, as it can augment content in-place without requiring website modifications and can enable context-aware assistance than generic assistive tools alone.
+
+---
+
+## Solution overview
+
+AccessAI is a browser extension composed of three specialised tools designed to support users with diverse accessibility needs.
+
+(i) Social-Cue: This assists users during live conversations or meetings by interpreting flow who find it difficult to interpret tone, intent, or social dynamics participate more confidently. It suggests appropriate pauses or moments to speak, identifies when a question is directed at the user, etc.
+
+(ii) Web-Sight: This supports navigation on information-dense or cluttered web pages. It helps users understand what to focus on first by surfacing contextual text bubbles, alt-text explanations on hover, and interpretations of images or interface elements. It also assists with form filling by explaining blank fields on hover and performing safe DOM actions such as focusing, filling, or clicking elements in response to user requests.
+
+(iii) Clear-Context: This supports cognitive accessibility by capturing and synthesising ongoing audio or textual context into persistent topic cards. These cards provide structured summaries, timestamps, and searchable notes, helping users retain and revisit information across meetings, lectures, or extended browsing sessions.
+
+---
+
+## Lived-experience examples
+
+Neurodivergent user (processing/social-cues):
+Lived problem: “I struggle to interpret images, reaction icons, or ambiguous buttons on social sites.”
+How solved: the social-cue module generates short, neutral descriptions of images and explains reaction contexts (who reacted, tone), turning ambiguous visuals into clear text the user can read or hear.
+
+Low-vision user (who prefers audio + large text):
+Lived problem: “Tiny UI controls and dense layouts make scanning exhausting.”
+How solved: the web-sight module enlarges and highlights key regions in the sidebar, thus offers TTS for summaries or full-article narration, and exposes single-click actions (e.g., expand hidden content) so the user needs fewer precise pointer movements.
+
+Cognitive or memory-impaired user (learning/attention):
+Lived problem: “I find it hard to keep up with online lectures, follow multiple instructions, and remember key points at the same time.”
+How solved: The Clear-Context module captures ongoing audio from lectures or meetings and continuously synthesises it into concise, structured topic cards with short summaries and timestamps, thereby, reducing cognitive overload and supporting sustained attention.
+
+---
+
+## Accessibility impact and generalisability
+
+AccessAI has a strong accessibility impact by enabling independent and understandable interaction with modern web content. By surfacing plain-language summaries, contextual explanations, and guided actions directly within the page, it reduces reliance on human assistance and lowers cognitive load for neurodivergent users, older adults, and people with learning or memory difficulties. Users can understand what matters, what to do next, and why—without needing to interpret dense layouts or ambiguous cues.
+
+The solution is also highly generalisable across contexts. Its DOM-aware approach allows it to work across news sites, social platforms, educational tools, and form-heavy services without requiring changes to the underlying websites. The same mechanisms that support lectures and meetings (Clear-Context), cluttered pages (Web-Sight), or conversations (Social-Cue) adapt naturally to different user groups and tasks. Importantly, AccessAI complements existing assistive technologies rather than replacing them, extending accessibility benefits across diverse environments and abilities.
+
+---
+
+## Retrospective — what we'd change next time
+
+If I were to approach this project again, I would place stronger emphasis on early user research and accessibility-first design. While AccessAI was motivated by real accessibility gaps, conducting structured interviews and co-design sessions with blind, low-vision, neurodivergent, and motor-impaired users from the outset would help ensure that features, language, and interaction patterns align more closely with real workflows and expectations.
+
+I would also design tighter integration with existing assistive technologies from the start, explicitly testing compatibility with screen readers and keyboard navigation to avoid conflicts and improve robustness. In parallel, I would adopt a stronger privacy-by-design approach, prioritising on-device processing for tasks such as summarisation or visual interpretation, with cloud-based AI strictly opt-in and minimal in context shared.
+
+Additionally, I would define an evaluation plan earlier, using measurable tasks and usability metrics to guide feature trade-offs.
 
 ---
