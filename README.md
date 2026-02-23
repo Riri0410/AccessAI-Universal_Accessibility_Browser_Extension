@@ -18,7 +18,7 @@ An AI-powered Chrome extension providing three real-time intelligent tools built
 
 ```
 BrowserExtension/
-├── extension/                     # Chrome Extension (Manifest v3)
+├── extension/                     # Chrome Extension. (Manifest v3)
 │   ├── manifest.json
 │   ├── background.js              # Service worker & API gateway
 │   ├── content-scripts/
