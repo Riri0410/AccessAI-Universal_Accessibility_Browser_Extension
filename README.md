@@ -176,54 +176,74 @@ const OPENAI_API_KEY = 'sk-your-key-here';
 
 ### Social Cue Coach
 
-A silent observer that surfaces real-time social intelligence during conversations and meetings.
+A silent, real-time social intelligence coach for video calls, designed for neurodivergent users who find it hard to read the room.
 
 **How it works:**
-- Connects to the OpenAI Realtime API via WebSocket
-- Passively listens to live audio without participating in the conversation
-- Generates brief 3–7 word insights tagged as one of three types:
-  - `Insight:` — observations about group dynamics or subtext
-  - `Action:` — suggested next moves for the user
-  - `Vibe:` — overall emotional temperature of the conversation
-- Insights are spoken quietly via Chrome's native TTS and shown in a live feed panel
+- Captures both your **microphone** and **tab/screen audio** so it hears all participants
+- Streams the mixed audio to the **OpenAI Realtime API** (WebSocket, text-only output)
+- Every 8 seconds, takes a **screenshot** via GPT-4o Vision to detect visual events (screen shares, demos)
+- Generates max 8-word insight cards tagged by type — shown in a live feed panel
+
+**Insight tag types:**
+| Tag | When it fires |
+|-----|---------------|
+| `[DIRECTED]` | Someone addresses you by name or gives a direct command/question |
+| `[GREETING]` | A greeting you should acknowledge |
+| `[HUMOR]` | Laughter or a joke — cue to react |
+| `[CELEBRATE]` | Good news or achievement shared |
+| `[STORY]` | Personal story being told — listen actively |
+| `[SCREEN]` | Screen share or demo just started |
+| `[EMOTION]` | Clear emotional tone — frustration, sarcasm |
+| `[TURN]` | Natural pause — your turn to speak (opt-in only) |
+| `[VIBE]` | Noticeable mood shift in the group |
+| `[FAREWELL]` | The meeting is collectively winding down |
+| `[NOTE]` | Something explicitly said that you should remember |
 
 **Key behaviours:**
-- Observation only — does not speak into the conversation
-- Continuous session until manually stopped
-- Low-latency responses via the Realtime WebSocket
+- Silent by default — outputs nothing during normal flowing conversation
+- **My Turn** toggle — opt-in to receive `[TURN]` cues when there's a speaking gap
+- Live audio waveform and RMS level meter confirm audio is flowing
+- Source badges show which streams are active: 🎤 Mic, 🔊 Tab, 👁 Vision
+- Observation only — never speaks into or interrupts the call
 
 ---
 
 ### Web-Sight Navigator
 
-A hands-free, voice-controlled browser agent powered by GPT-4o function calling and semantic page understanding.
+A hands-free, voice-controlled browser agent for users with dyslexia, powered by GPT-4o function calling and OpenAI Realtime voice.
 
 **How it works:**
-- Speak a natural language goal (e.g. "Find machine learning courses on this site")
-- GPT-4o plans a multi-step sequence of browser actions to fulfil the goal
-- Executes up to 18 steps autonomously, re-reading the page between steps
-- Falls back to typed commands if voice input is unavailable
+- You share your screen and microphone at session start
+- Your speech is transcribed live using **OpenAI Whisper** (English, via Realtime WebSocket)
+- On startup, a screenshot is taken and GPT-4o Vision describes the current page in one sentence
+- Spoken commands are passed to a **GPT-4o agent** that plans and executes up to 14 steps
+- AI replies are spoken back to you using **OpenAI's alloy voice** (PCM16 audio streamed via Realtime WebSocket), not browser TTS
+- Microphone is muted while the AI is speaking to prevent echo
 
 **Available browser actions:**
 
 | Action | What it does |
 |--------|-------------|
-| `click` | Clicks any element by CSS selector |
-| `type` | Types text into an input field |
-| `navigate` | Goes to a URL |
-| `scroll` | Scrolls the page or an element |
-| `read_page` | Reads visible text content (3000 char limit) |
-| `find_elements` | Finds elements matching a description |
-| `press_key` | Presses a keyboard key |
-| `select_option` | Selects a dropdown option |
+| `capture_screen` | Takes a JPEG screenshot and analyses it with GPT-4o Vision |
+| `get_page_context` | Reads the current URL, title, and visible form fields |
+| `read_page` | Reads up to 4000 characters of visible page text |
+| `click_element` | Clicks any element by CSS selector |
+| `type_text` | Types text into an input field |
+| `navigate_to` | Goes to a URL |
+| `scroll_page` | Scrolls up, down, to top, or to bottom |
+| `describe_image` | Describes an image using GPT-4o Vision |
 
-**Semantic search intelligence:**
-- Before searching, the agent reads the page and navigation to understand the site's own vocabulary
-- Never types literal user words into a search on a specialised site — it maps the intent to the site's taxonomy (e.g. user says "business courses", site calls it "Business Administration", agent searches the site's term)
-- Prefers clicking nav links over searching when possible
+**Image hover descriptions:**
+- Hovering over any image for 800 ms triggers an AI vision description shown in a tooltip
+- Descriptions are also spoken aloud (max 15 words, focuses on subjects, actions, clothing)
+
+**Conversation memory:**
+- Last 30 exchanges are saved in `chrome.storage.local`
+- History is automatically wiped when Chrome restarts
+- "Clear history" button resets memory manually
 
 **Safety:**
-- Actions containing "buy", "checkout", or "pay" require explicit voice confirmation before proceeding
+- Vague or unclear commands receive: *"Not clear, please elaborate."* — no guessing
 
 ---
 
@@ -232,13 +252,13 @@ A hands-free, voice-controlled browser agent powered by GPT-4o function calling 
 ClearContext watches your screen and listens to your lecture or video, then uses AI to automatically build structured, markdown-rich knowledge cards organised into named workspaces.
 
 **Pipeline:**
-1. You share your screen or a browser tab — both audio and video are captured
-2. Audio is split into 8-second chunks and transcribed by **OpenAI Whisper**
-3. Every 3 transcripts, **GPT-4o Vision** analyses the rolling transcript *alongside a live screenshot* of your screen
+1. You share your screen or a browser tab — video and audio are captured
+2. Audio is split into **8-second chunks** and transcribed by **OpenAI Whisper**
+3. Every **3 transcripts**, **GPT-4o Vision** analyses the rolling transcript *alongside a live screenshot* of your screen
 4. AI decides whether to create a new card, update an existing one, or skip
-5. Cards are immediately saved to Chrome storage under your workspace name
+5. Cards are immediately saved to `chrome.storage.local` under your workspace name
 
-**No microphone required** — only system/tab audio is used.
+**No microphone required** — only system/tab audio is captured.
 
 ---
 
