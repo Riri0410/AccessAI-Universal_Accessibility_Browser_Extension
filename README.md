@@ -37,10 +37,6 @@ const OPENAI_API_KEY = 'sk-your-key-here';
 
 ---
 
-> ⚠️ Never share or commit your API key to version control.
-
----
-
 ## Problem statement
 
 Many modern websites remain difficult to perceive, understand, and navigate for people with sensory, cognitive, or motor impairments. Complex layouts, visually dense content, ambiguous icons, and multi-step interactions often limit independent access to online information and services.
@@ -172,6 +168,8 @@ const OPENAI_API_KEY = 'sk-your-key-here';
 
 ### Social Cue Coach
 
+![Social Cue Coach](images/Social%20Cue.png)
+  
 A silent observer that surfaces real-time social intelligence during conversations and meetings.
 
 **How it works:**
@@ -191,6 +189,8 @@ A silent observer that surfaces real-time social intelligence during conversatio
 ---
 
 ### Web-Sight Navigator
+
+![Web-Sight Navigator](images/Web%20Sight.png)
 
 A hands-free, voice-controlled browser agent powered by GPT-4o function calling and semantic page understanding.
 
@@ -224,6 +224,8 @@ A hands-free, voice-controlled browser agent powered by GPT-4o function calling 
 ---
 
 ### ClearContext — Intelligent Topic Card Engine
+
+![ClearContext](images/Clear%20Context.png)
 
 ClearContext watches your screen and listens to your lecture or video, then uses AI to automatically build structured, markdown-rich knowledge cards organised into named workspaces.
 
