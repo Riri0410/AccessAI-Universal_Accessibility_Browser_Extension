@@ -4,6 +4,41 @@ An AI-powered Chrome extension providing three real-time intelligent tools built
 
 ---
 
+# AccessAI — Quick Setup
+
+> **You will need an OpenAI API key** to use this extension. Get one at [platform.openai.com/api-keys](https://platform.openai.com/api-keys). Your key needs access to GPT-4o, Whisper, and TTS.
+
+---
+
+## Install in Chrome
+
+**1. Add your API key**
+
+Open `extension/background.js` and replace the placeholder with your key:
+
+```js
+const OPENAI_API_KEY = 'sk-your-key-here';
+```
+
+**2. Load the extension**
+
+1. Go to `chrome://extensions/` in your browser
+2. Turn on **Developer mode** (toggle in the top-right corner)
+3. Click **Load unpacked**
+4. Select the `extension/` folder from this project
+
+**3. Open the extension**
+
+> ⚠️ The extension **does not work on a blank new tab**. You must have a real website open first.
+
+1. Open a new tab and go to any website (e.g. `google.com`)
+2. Click the **AccessAI icon** in your Chrome toolbar — or press `Alt+A`
+3. The sidebar will appear on the right side of the page
+
+---
+
+> ⚠️ Never share or commit your API key to version control.
+
 ---
 
 ## Problem statement
