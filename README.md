@@ -41,7 +41,10 @@ const OPENAI_API_KEY = 'sk-your-key-here';
 
 Many modern websites remain difficult to perceive, understand, and navigate for people with sensory, cognitive, or motor impairments. Complex layouts, visually dense content, ambiguous icons, and multi-step interactions often limit independent access to online information and services.
 
-AccessAI addresses these challenges by functioning as an on-page accessibility assistant embedded directly within the browser. It targets three core issues: (1) difficulty locating relevant information on content-heavy or poorly structured pages, (2) challenges in interpreting visual or social cues such as images, icons, or interface states, and (3) barriers to completing multi-step interactions caused by limited fine motor control or cognitive overload.
+AccessAI addresses these challenges by functioning as an on-page accessibility assistant embedded directly within the browser. It targets three core issues: <br>
+(1) difficulty locating relevant information on content-heavy or poorly structured pages, <br>
+(2) challenges in interpreting visual or social cues such as images, icons, or interface states, and <br>
+(3) barriers to completing multi-step interactions caused by limited fine motor control or cognitive overload.
 
 AccessAI improves accessibility through features such as text-to-speech, content summarisation, and DOM-based highlighting. It enhances cognitive accessibility by simplifying language, and explaining interface elements. By combining multimodal interaction with contextual understanding of web pages, AccessAI enables more inclusive and independent web access for users with diverse abilities.
 
@@ -53,9 +56,9 @@ Many websites remain difficult to perceive, understand, and navigate for people 
 
 This project is motivated by the need for a lightweight, page-integrated accessibility assistant that complements existing tools rather than replacing them. By combining DOM-aware techniques with AI-assisted summarisation and interpretation, the system makes intent, ambiguity or social content more immediately accessible.
 
-The key motivations are to empower users to complete common tasks such as reading content, following links, or filling forms independently to:
-(i) reduce cognitive load;
-(ii) interpret visual or social cues that may otherwise be missed; and 
+The key motivations are to empower users to complete common tasks such as reading content, following links, or filling forms independently to:<br>
+(i) reduce cognitive load;<br>
+(ii) interpret visual or social cues that may otherwise be missed; and <br>
 (iii) provide multimodal interaction with users.
 
 A browser extension is chosen as a practical solution, as it can augment content in-place without requiring website modifications and can enable context-aware assistance than generic assistive tools alone.
@@ -66,27 +69,27 @@ A browser extension is chosen as a practical solution, as it can augment content
 
 AccessAI is a browser extension composed of three specialised tools designed to support users with diverse accessibility needs.
 
-(i) Social-Cue: This assists users during live conversations or meetings by interpreting flow who find it difficult to interpret tone, intent, or social dynamics participate more confidently. It suggests appropriate pauses or moments to speak, identifies when a question is directed at the user, etc.
+(i) **Social-Cue:** This assists users during live conversations or meetings by interpreting flow who find it difficult to interpret tone, intent, or social dynamics participate more confidently. It suggests appropriate pauses or moments to speak, identifies when a question is directed at the user, etc.
 
-(ii) Web-Sight: This supports navigation on information-dense or cluttered web pages. It helps users understand what to focus on first by surfacing contextual text bubbles, alt-text explanations on hover, and interpretations of images or interface elements. It also assists with form filling by explaining blank fields on hover and performing safe DOM actions such as focusing, filling, or clicking elements in response to user requests.
+(ii) **Web-Sight:** This supports navigation on information-dense or cluttered web pages. It helps users understand what to focus on first by surfacing contextual text bubbles, alt-text explanations on hover, and interpretations of images or interface elements. It also assists with form filling by explaining blank fields on hover and performing safe DOM actions such as focusing, filling, or clicking elements in response to user requests.
 
-(iii) Clear-Context: This supports cognitive accessibility by capturing and synthesising ongoing audio or textual context into persistent topic cards. These cards provide structured summaries, timestamps, and searchable notes, helping users retain and revisit information across meetings, lectures, or extended browsing sessions.
+(iii) **Clear-Context:** This supports cognitive accessibility by capturing and synthesising ongoing audio or textual context into persistent topic cards. These cards provide structured summaries, timestamps, and searchable notes, helping users retain and revisit information across meetings, lectures, or extended browsing sessions.
 
 ---
 
 ## Lived-experience examples
 
-Neurodivergent user (processing/social-cues):
-Lived problem: “I struggle to interpret images, reaction icons, or ambiguous buttons on social sites.”
-How solved: the social-cue module generates short, neutral descriptions of images and explains reaction contexts (who reacted, tone), turning ambiguous visuals into clear text the user can read or hear.
+<strong>Neurodivergent user (processing/social-cues): </strong><br>
+<strong>Lived problem:</strong> “I struggle to interpret images, reaction icons, or ambiguous buttons on social sites.” <br>
+<strong>How solved:</strong> the social-cue module generates short, neutral descriptions of images and explains reaction contexts (who reacted, tone), turning ambiguous visuals into clear text the user can read or hear.
 
-Low-vision user (who prefers audio + large text):
-Lived problem: “Tiny UI controls and dense layouts make scanning exhausting.”
-How solved: the web-sight module enlarges and highlights key regions in the sidebar, thus offers TTS for summaries or full-article narration, and exposes single-click actions (e.g., expand hidden content) so the user needs fewer precise pointer movements.
+<strong>Low-vision user (who prefers audio + large text): </strong><br>
+<strong>Lived problem:</strong> “Tiny UI controls and dense layouts make scanning exhausting.” <br>
+<strong>How solved:</strong> The web-sight module enlarges and highlights key regions in the sidebar, thus offers TTS for summaries or full-article narration, and exposes single-click actions (e.g., expand hidden content) so the user needs fewer precise pointer movements.
 
-Cognitive or memory-impaired user (learning/attention):
-Lived problem: “I find it hard to keep up with online lectures, follow multiple instructions, and remember key points at the same time.”
-How solved: The Clear-Context module captures ongoing audio from lectures or meetings and continuously synthesises it into concise, structured topic cards with short summaries and timestamps, thereby, reducing cognitive overload and supporting sustained attention.
+<strong>Cognitive or memory-impaired user (learning/attention):</strong> <br>
+<strong>Lived problem:</strong> “I find it hard to keep up with online lectures, follow multiple instructions, and remember key points at the same time.” <br>
+<strong>How solved:</strong> The Clear-Context module captures ongoing audio from lectures or meetings and continuously synthesises it into concise, structured topic cards with short summaries and timestamps, thereby, reducing cognitive overload and supporting sustained attention.
 
 ---
 
