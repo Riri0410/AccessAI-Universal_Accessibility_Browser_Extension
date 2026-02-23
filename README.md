@@ -2,6 +2,14 @@
 
 An AI-powered Chrome extension providing three real-time intelligent tools built on OpenAI's GPT-4o, Whisper, Realtime API, and TTS — all surfaced through a unified sidebar that works on any website.
 
+<p align="center">
+  <img src="images/Social%20Cue.png" width="30%" alt="Social Cue" />
+  &nbsp;
+  <img src="images/Web%20Sight.png" width="30%" alt="Web Sight" />
+  &nbsp;
+  <img src="images/Clear%20Context.png" width="30%" alt="Clear Context" />
+</p>
+
 ---
 
 # AccessAI — Quick Setup
@@ -168,8 +176,6 @@ const OPENAI_API_KEY = 'sk-your-key-here';
 
 ### Social Cue Coach
 
-![Social Cue Coach](images/Social%20Cue.png)
-  
 A silent observer that surfaces real-time social intelligence during conversations and meetings.
 
 **How it works:**
@@ -189,8 +195,6 @@ A silent observer that surfaces real-time social intelligence during conversatio
 ---
 
 ### Web-Sight Navigator
-
-![Web-Sight Navigator](images/Web%20Sight.png)
 
 A hands-free, voice-controlled browser agent powered by GPT-4o function calling and semantic page understanding.
 
@@ -224,8 +228,6 @@ A hands-free, voice-controlled browser agent powered by GPT-4o function calling 
 ---
 
 ### ClearContext — Intelligent Topic Card Engine
-
-![ClearContext](images/Clear%20Context.png)
 
 ClearContext watches your screen and listens to your lecture or video, then uses AI to automatically build structured, markdown-rich knowledge cards organised into named workspaces.
 
