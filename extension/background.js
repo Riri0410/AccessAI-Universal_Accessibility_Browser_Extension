@@ -11,9 +11,7 @@ chrome.runtime.onInstalled.addListener(() => {
 
 // ─── On Chrome startup: clear session data, auto-open sidebar ──
 chrome.runtime.onStartup.addListener(() => {
-  // Clear Web-Sight conversation history on Chrome restart
   chrome.storage.local.remove('websight_conversation_history');
-  // Set sidebar to auto-open on next page load
   chrome.storage.local.set({ sidebarOpen: true, activeMode: 'web-sight' });
   activeMode = 'web-sight';
 });
@@ -55,14 +53,26 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   'WEBSIGHT_OPEN_TAB':     handleWebSightOpenTab,
   'WEBSIGHT_CLOSE_TAB':    handleWebSightCloseTab,
   'WEBSIGHT_SWITCH_TAB':   handleWebSightSwitchTab,
+  'WEBSIGHT_CAPTURE_VISIBLE_TAB': handleCaptureVisibleTab // <-- The new handler for screenshots
 };
   const handler = handlers[message.type];
   if (handler) {
     handler(message, sender, sendResponse);
     return true; // keep channel open for async
   }
-  
 });
+
+// ─── NEW: Screenshot handler ──────────────────────────────────
+function handleCaptureVisibleTab(message, sender, sendResponse) {
+  chrome.tabs.captureVisibleTab(null, { format: 'jpeg', quality: 40 }, (dataUrl) => {
+    if (chrome.runtime.lastError) {
+      sendResponse({ success: false, error: chrome.runtime.lastError.message });
+    } else {
+      sendResponse({ success: true, dataUrl: dataUrl });
+    }
+  });
+  return true; 
+}
 
 function handleGetApiKey(m, s, sr) { sr({ key: OPENAI_API_KEY }); }
 
@@ -151,7 +161,6 @@ function handleToggleSidebar(message, sender, sendResponse) {
   });
 }
 
-// Track Web-Sight active state per tab for reconnection after navigation
 const websightActiveTabs = new Set();
 
 function handleWebSightState(message, sender, sendResponse) {
@@ -186,37 +195,14 @@ function handleWebSightCloseTab(message, sender, sendResponse) {
   return true;
 }
 
-function handleWebSightNavigate(message, sender, sendResponse) {
-  chrome.tabs.update(sender.tab.id, { url: message.url }, () => {
-    sendResponse({ success: !chrome.runtime.lastError });
-  });
-  return true;
-}
-
-function handleWebSightOpenTab(message, sender, sendResponse) {
-  chrome.tabs.create({ url: message.url }, () => {
-    sendResponse({ success: !chrome.runtime.lastError });
-  });
-  return true;
-}
-
-function handleWebSightCloseTab(message, sender, sendResponse) {
-  chrome.tabs.remove(sender.tab.id, () => {
-    sendResponse({ success: !chrome.runtime.lastError });
-  });
-  return true;
-}
-
 function handleWebSightSwitchTab(message, sender, sendResponse) {
   const query = (message.query || '').toLowerCase();
   chrome.tabs.query({}, tabs => {
-    // Find a tab whose title or URL contains the query
     const match = tabs.find(t =>
       t.title?.toLowerCase().includes(query) ||
       t.url?.toLowerCase().includes(query)
     );
     if (match) {
-      // Focus the window first, then activate the tab
       chrome.windows.update(match.windowId, { focused: true }, () => {
         chrome.tabs.update(match.id, { active: true }, () => {
           sendResponse({ success: true, title: match.title });
@@ -229,7 +215,6 @@ function handleWebSightSwitchTab(message, sender, sendResponse) {
   return true;
 }
 
-// ─── Extension icon click ─────────────────────────────────────
 chrome.action.onClicked.addListener((tab) => {
   if (!tab.url || tab.url.startsWith('chrome') || tab.url.startsWith('about') || tab.url.startsWith('edge')) return;
   chrome.tabs.sendMessage(tab.id, { type: 'TOGGLE_SIDEBAR' }, () => {
@@ -243,7 +228,6 @@ chrome.action.onClicked.addListener((tab) => {
   });
 });
 
-// ─── Tab navigation: re-inject scripts and restore state ──────
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (changeInfo.status !== 'complete') return;
   if (!tab.url || tab.url.startsWith('chrome') || tab.url.startsWith('about') || tab.url.startsWith('edge')) return;
@@ -252,12 +236,9 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     if (chrome.runtime.lastError) return;
     if (!result.sidebarOpen) return;
 
-    // Always restore sidebar + active mode after navigation completes.
-    // We try to contact the content script first; if it's not ready, inject it.
     const doRestore = () => {
       chrome.tabs.sendMessage(tabId, { type: 'RESTORE_STATE', mode: result.activeMode }, (response) => {
         if (chrome.runtime.lastError) {
-          // Scripts not loaded yet — inject then retry
           injectScripts(tabId);
           setTimeout(() => {
             chrome.tabs.sendMessage(tabId, { type: 'RESTORE_STATE', mode: result.activeMode }).catch(() => {});
@@ -266,7 +247,6 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
       });
     };
 
-    // Small delay to let document_idle scripts settle
     setTimeout(doRestore, 350);
   });
 });
