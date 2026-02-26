@@ -8,14 +8,7 @@
   if (window.__websight_v19) return;
   window.__websight_v19 = true;
 
-  const SYSTEM_PROMPT = `You are Web-Sight, an AI web assistant for a user with dyslexia.
-
-CRITICAL RULES:
-1. NO LOOPING AND UNCLEAR COMMANDS: If a command is vague, incomplete, or you do not understand what the user wants, DO NOT guess. Reply EXACTLY with: "Not clear, please elaborate."
-2. CAPTURE SCREEN: Only use capture_screen when the user explicitly asks about the screen layout or says they are lost/overwhelmed. Give ONE simple first step.
-3. FORMS & INPUTS: If the page context shows forms, proactively tell the user what they are for (e.g. "I see a form for your education. You should type your recent degree here.").
-4. SUMMARIZE: Use read_page to summarize the page if asked.
-5. IMAGES: Describe actions and clothing (e.g. "Cat running", "Human wearing a saree").`;
+  const SYSTEM_PROMPT = `You are a helpful web assistant. Use the available tools to help the user. When asked about anything visual, always call capture_screen first. Keep all responses short — 1 to 3 sentences max. No long paragraphs. Use markdown: **bold**, bullet points with -, and \`code\` where helpful.`;
 
   // FIX: Matching the exact key that background.js wipes on chrome.runtime.onStartup
   const HISTORY_KEY = 'websight_conversation_history'; 
@@ -39,7 +32,7 @@ CRITICAL RULES:
 
   // ─── Filler detection ────────────────────────
   const FILLERS = /^(bye|goodbye|hello|hi|hey|okay|ok|yes|no|sure|thanks|ready|testing|test|hmm|uh|um|ah)\.?$/i;
-  function isFiller(text) { return FILLERS.test(text.trim()) || (text.trim().split(/\s+/).length <= 2 && text.trim().length < 8); }
+  function isFiller(text) { return FILLERS.test(text.trim()); }
 
   // ─── Tools ────────────────────────────────────────────────
   const TOOLS = [
@@ -65,7 +58,7 @@ CRITICAL RULES:
     const messages = [
       { role: 'system', content: SYSTEM_PROMPT },
       ...gptHistory(),
-      { role: 'user', content: `Command: "${command}"\nPage Context:\n${pageContext()}` },
+      { role: 'user', content: `${command}\n\nPage: ${document.title} — ${location.href}\n${pageContext()}` },
     ];
 
     let steps = 0, reply = '';
@@ -92,13 +85,8 @@ CRITICAL RULES:
     } catch (err) { reply = `Error: ${err.message}`; }
 
     if (reply && !cancelTask) {
-      addMsg('response', reply); 
-      
-      // Keep soft prompt silent (UI only)
-      if (!reply.includes("Not clear, please elaborate.")) {
-        speak(reply);
-      }
-      
+      addMsg('response', reply);
+      speak(reply);
       history.push({ role: 'user', type: 'cmd', text: command, time: ts() });
       history.push({ role: 'ai', type: 'reply', text: reply, time: ts() });
       saveHistory();
@@ -128,8 +116,8 @@ CRITICAL RULES:
 
         const vResp = await ipc({ type: 'API_REQUEST', model: 'gpt-4o', messages: [{
             role: 'user', content: [
-            { type: 'text', text: "What is on this screen? Describe it simply." },
-            { type: 'image_url', image_url: { url: dataUrl, detail: 'low' } }
+            { type: 'image_url', image_url: { url: dataUrl, detail: 'high' } },
+            { type: 'text', text: "Describe what's on this screen in 2-3 short sentences. Mention key text, diagram elements, or code. Be brief and clear." }
             ]
         }]});
         return { success: true, description: vResp.data?.choices?.[0]?.message?.content };
@@ -321,8 +309,9 @@ CRITICAL RULES:
       ws.onopen = () => {
         clearTimeout(timeout);
         ws.send(JSON.stringify({ type: 'session.update', session: { 
-            modalities: ['text','audio'], input_audio_transcription: { model: 'whisper-1' },
-            turn_detection: { type: 'server_vad', threshold: 0.5, silence_duration_ms: 1200 }
+            modalities: ['text','audio'],
+            input_audio_transcription: { model: 'whisper-1', language: 'en' },
+            turn_detection: { type: 'server_vad', threshold: 0.7, silence_duration_ms: 800, prefix_padding_ms: 300 }
         }}));
         setDot('on');
         
@@ -356,28 +345,74 @@ CRITICAL RULES:
   }
 
   // ─── Helpers ──────────────────────────────────────────────
-  function speak(text) {
-    if (!text) return;
-    
-    window.speechSynthesis.resume();
-    window.speechSynthesis.cancel();
-    
-    const utt = new SpeechSynthesisUtterance(text.replace(/<[^>]*>/g,''));
-    utt.rate = 0.95; 
-    utt.onstart = () => { isSpeaking = true; };
-    utt.onend = () => { isSpeaking = false; };
-    utt.onerror = () => { isSpeaking = false; };
-    isSpeaking = true; 
-    window.speechSynthesis.speak(utt);
+  let _ttsAudio = null;
+
+  function stripMarkdown(text) {
+    return (text || '')
+      .replace(/```[\s\S]*?```/g, '')
+      .replace(/`([^`]+)`/g, '$1')
+      .replace(/\*\*(.+?)\*\*/g, '$1')
+      .replace(/\*(.+?)\*/g, '$1')
+      .replace(/^#{1,3} /gm, '')
+      .replace(/^[-•] /gm, '')
+      .replace(/<[^>]*>/g, '')
+      .replace(/\n/g, ' ')
+      .replace(/  +/g, ' ')
+      .trim();
   }
-  function stopSpeech() { 
-      if (window.speechSynthesis) window.speechSynthesis.cancel(); 
-      isSpeaking = false; 
+
+  async function speak(text) {
+    if (!text || !apiKey) return;
+    stopSpeech();
+    const clean = stripMarkdown(text);
+    if (!clean) return;
+    isSpeaking = true;
+    try {
+      const resp = await fetch('https://api.openai.com/v1/audio/speech', {
+        method: 'POST',
+        headers: { 'Authorization': 'Bearer ' + apiKey, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: 'tts-1', voice: 'nova', input: clean, speed: 1.0 }),
+      });
+      if (!resp.ok) throw new Error('TTS ' + resp.status);
+      const blob = await resp.blob();
+      const url = URL.createObjectURL(blob);
+      _ttsAudio = new Audio(url);
+      _ttsAudio.onended = () => { isSpeaking = false; URL.revokeObjectURL(url); _ttsAudio = null; };
+      _ttsAudio.onerror = () => { isSpeaking = false; _ttsAudio = null; };
+      _ttsAudio.play();
+    } catch (e) {
+      isSpeaking = false;
+      console.warn('[WebSight] TTS error:', e.message);
+    }
   }
+
+  function stopSpeech() {
+    if (_ttsAudio) { _ttsAudio.pause(); _ttsAudio = null; }
+    isSpeaking = false;
+  }
+  function renderMarkdown(text) {
+    if (!text) return '';
+    return text
+      .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+      .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+      .replace(/\*(.+?)\*/g, '<em>$1</em>')
+      .replace(/`([^`]+)`/g, '<code style="background:rgba(255,255,255,.13);padding:1px 5px;border-radius:3px;font-family:monospace;font-size:12px;">$1</code>')
+      .replace(/^### (.+)$/gm, '<div style="font-weight:700;margin:4px 0 2px;">$1</div>')
+      .replace(/^## (.+)$/gm, '<div style="font-weight:800;margin:5px 0 2px;">$1</div>')
+      .replace(/^[-•] (.+)$/gm, '<div style="padding-left:14px;position:relative;margin:2px 0;"><span style="position:absolute;left:2px;color:#7dd3fc;">•</span>$1</div>')
+      .replace(/\n/g, '<br>');
+  }
+
   function addMsg(type, text) {
     if (!outputEl) return;
-    const div = document.createElement('div'); div.className = `ws-msg ws-${type}`; div.textContent = text;
+    const div = document.createElement('div'); div.className = `ws-msg ws-${type}`;
+    if (type === 'response') {
+      div.innerHTML = renderMarkdown(text);
+    } else {
+      div.textContent = text;
+    }
     outputEl.appendChild(div); div.scrollIntoView();
+    return div;
   }
   function pageContext() { 
       const forms = [...document.querySelectorAll('input:not([type="hidden"]), textarea, select')].slice(0, 15).map(el => el.placeholder || el.name || el.id || el.getAttribute('aria-label') || 'input field');
