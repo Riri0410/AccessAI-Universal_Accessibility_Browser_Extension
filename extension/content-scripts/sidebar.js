@@ -1,8 +1,8 @@
 // ============================================================
-// AccessAI Unified Sidebar v2
+// AccessAI Unified Sidebar v2 — Fixed
 // - Right-side sidebar that PUSHES page content (never overlaps)
 // - On meet.google.com: directly nudges Meet's video grid
-//   so the sidebar sits beside it, not on top of it
+// FIX #15: pushGenericLayout guards against duplicate style tags
 // ============================================================
 
 (function () {
@@ -19,9 +19,6 @@
   let currentMode = null;
 
   // ─── Meet layout management ───────────────────────────────
-  // Google Meet uses a specific container for the video grid.
-  // We inject a CSS override that reduces its right-margin to
-  // make room for the sidebar, rather than overlapping it.
   let meetStyleEl = null;
 
   function pushMeetLayout(open) {
@@ -34,16 +31,10 @@
     }
 
     if (open) {
-      // Meet's main video container. These selectors target the
-      // known Meet DOM structure as of 2024–2025.
-      // We use multiple selectors to be robust against Meet updates.
       meetStyleEl.textContent = `
-        /* Shrink the main content area so sidebar sits beside, not over it */
         body[data-accessai-open] {
           overflow: hidden !important;
         }
-
-        /* Meet's root layout wrapper */
         body[data-accessai-open] c-wiz,
         body[data-accessai-open] [jscontroller][data-use-native-client-navigation],
         body[data-accessai-open] [jscontroller][jsaction*="rcuQ6b"] {
@@ -52,15 +43,11 @@
           transition: width 0.35s cubic-bezier(0.4, 0, 0.2, 1),
                       max-width 0.35s cubic-bezier(0.4, 0, 0.2, 1);
         }
-
-        /* Meet's inner video grid / stage */
         body[data-accessai-open] [data-allocation-index],
         body[data-accessai-open] [jsname="F57Jan"],
         body[data-accessai-open] [jsname="HlFzId"] {
           max-width: calc(100vw - ${SIDEBAR_WIDTH}px) !important;
         }
-
-        /* Bottom controls bar — keep centred relative to the narrowed space */
         body[data-accessai-open] [jsname="x8HMZb"],
         body[data-accessai-open] [data-self-name],
         body[data-accessai-open] [jscontroller="DE0Bme"] {
@@ -75,34 +62,35 @@
     }
   }
 
-  // For non-Meet pages, push layout to the left to make room for the sidebar.
-  // We inject a <style> tag rather than relying on inline margin-right so that
-  // site-specific layout containers (YouTube, complex SPAs) also reflow.
+  // FIX #15: Use a single persistent style element, check for existing before creating
   let pushStyleEl = null;
 
   function pushGenericLayout(open) {
     if (IS_MEET) return;
 
-    // Remove any existing push style
-    if (pushStyleEl) { pushStyleEl.remove(); pushStyleEl = null; }
-    // Reset inline styles
-    document.documentElement.style.removeProperty('margin-right');
-    document.documentElement.style.removeProperty('transition');
+    if (!open) {
+      // Remove push style
+      if (pushStyleEl) { pushStyleEl.remove(); pushStyleEl = null; }
+      document.documentElement.style.removeProperty('margin-right');
+      document.documentElement.style.removeProperty('transition');
+      return;
+    }
 
-    if (!open) return;
+    // Guard: don't create duplicate style tags
+    if (pushStyleEl && document.head.contains(pushStyleEl)) return;
+
+    // Clean up stale reference if it was removed from DOM
+    if (pushStyleEl) { pushStyleEl = null; }
 
     pushStyleEl = document.createElement('style');
     pushStyleEl.id = 'accessai-push-layout';
     pushStyleEl.textContent = `
-      /* ── Generic push: shrink everything to the left of the sidebar ── */
       html {
         margin-right: ${SIDEBAR_WIDTH}px !important;
         max-width: calc(100% - ${SIDEBAR_WIDTH}px) !important;
         overflow-x: hidden !important;
         transition: margin-right 0.35s cubic-bezier(0.4,0,0.2,1) !important;
       }
-
-      /* ── YouTube specific ── */
       ytd-app,
       ytd-page-manager,
       #page-manager,
@@ -110,14 +98,10 @@
       #masthead {
         max-width: calc(100vw - ${SIDEBAR_WIDTH}px) !important;
       }
-
-      /* ── Keep any full-viewport-width overlays/modals inside the pushed area ── */
       [style*="width: 100vw"],
       [style*="width:100vw"] {
         width: calc(100vw - ${SIDEBAR_WIDTH}px) !important;
       }
-
-      /* ── Don't shift the AccessAI sidebar itself ── */
       #accessai-sidebar,
       #accessai-ws-hover-overlay {
         margin-right: 0 !important;
@@ -298,12 +282,10 @@
 
   // ─── On Meet: auto-open on Social Cue when call starts ────
   if (IS_MEET) {
-    // Watch for Meet's call UI to appear (the video grid loads after a delay)
     const meetObserver = new MutationObserver(() => {
       const inCall = document.querySelector('[data-call-ended], [jsname="F57Jan"], [data-allocation-index]');
       if (inCall && !isOpen) {
         meetObserver.disconnect();
-        // Auto-open on Social Cue tab when a call is detected
         setTimeout(() => {
           openSidebar();
           selectMode('social-cue');
@@ -311,8 +293,6 @@
       }
     });
     meetObserver.observe(document.body, { childList: true, subtree: true });
-
-    // Stop observing after 30s to avoid ongoing overhead
     setTimeout(() => meetObserver.disconnect(), 30000);
   }
 

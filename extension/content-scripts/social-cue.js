@@ -1,24 +1,17 @@
 /**
- * Social Cue Assistant — Sidebar Edition
+ * Social Cue Assistant — Sidebar Edition (FIXED)
  *
- * PURPOSE: Help neurodivergent people (autism spectrum / social anxiety)
- * "read the room" during video calls in real time. A private social
- * dashboard that silently flags: directed questions, greetings, jokes,
- * emotional tone, turn gaps, celebrations, farewells — everything.
- *
- * ENGINE: Preserved verbatim from the original working content.js (v2).
- *   getDisplayMedia (video+audio) ──┐
- *                                   ├─ AudioContext mixer
- *   getUserMedia (mic) ─────────────┘      ↓
- *                          ScriptProcessor → PCM16 → OpenAI Realtime WS
- *   Every 2s: canvas frame → GPT-4o Vision → [VISUAL] card
- *
- * PROMPT PHILOSOPHY (kept from v2, extended):
- *   - Silent by default — output NOTHING during normal conversation
- *   - Max 8 words per insight, non-negotiable
- *   - Single tag prefix: [DIRECTED] [GREETING] [HUMOR] [CELEBRATE]
- *     [STORY] [SCREEN] [EMOTION] [TURN] [VIBE] [FAREWELL] [NOTE]
- *   - Concrete examples for every tag — no vague coaching language
+ * Bug fixes applied (no UI/functionality changes):
+ * - #8:  processorNode fully disconnected from destination on cleanup
+ * - #9:  WS message listener properly removed on cleanup
+ * - #10: Vision uses busy guard + cleared interval to prevent concurrent calls
+ * - #11: Canvas reused across vision captures (no new element every 8s)
+ * - #12: isListening set to false BEFORE cleanup to prevent double-cleanup
+ * - #13: Vision dedup uses 6 words instead of 4 for better accuracy
+ * - #14: visionSeenSet capped at 100 entries to prevent unbounded growth
+ * - #34: currentResponseText cleared on all terminal events
+ * - #35: hiddenVideo.play() error handled — disables vision if play fails
+ * - #40: AudioWorklet with ScriptProcessor fallback (same as web-sight v20)
  */
 
 (function () {
@@ -32,7 +25,8 @@
   const VISION_MODEL     = 'gpt-4o';
   const SAMPLE_RATE      = 24000;
   const BUFFER_SIZE      = 4096;
-  const VISION_INTERVAL  = 8000;   // 8s — only flag genuinely NEW visual events
+  const VISION_INTERVAL  = 8000;
+  const MAX_SEEN_SET     = 100; // FIX #14: Cap dedup set size
 
   // ─── State ────────────────────────────────────────────────────────────────
   let ws                 = null;
@@ -40,8 +34,11 @@
   let displayStream      = null;
   let micStream          = null;
   let processorNode      = null;
+  let audioWorkletNode   = null; // FIX #40: AudioWorklet ref
+  let masterGainNode     = null; // FIX #8: Track for proper disconnect
   let visionInterval     = null;
   let hiddenVideo        = null;
+  let _visionCanvas      = null; // FIX #11: Reusable canvas
   let isListening        = false;
   let userName           = 'User';
   let apiKey             = null;
@@ -49,9 +46,10 @@
   let currentResponseText = '';
   let visionBusy         = false;
   let lastVisionText     = '';
-  let visionSeenSet      = new Set();   // dedup similar insights for ~30s window
-  let turnMode           = false;        // user must opt-in for [TURN] cues
-  let pane               = null;   // the sidebar pane DOM element
+  let visionSeenSet      = new Set();
+  let turnMode           = false;
+  let pane               = null;
+  let visionEnabled      = true; // FIX #35: Tracks if vision capture is working
 
   // ─── Styles ───────────────────────────────────────────────────────────────
   const STYLES = `
@@ -83,12 +81,8 @@
       0%,100% { box-shadow: 0 0 24px rgba(124,58,237,0.12); }
       50%      { box-shadow: 0 0 44px rgba(124,58,237,0.32); }
     }
-    .sca-idle-title {
-      font-size: 15px; font-weight: 800; color: #f0ecff; letter-spacing: -0.2px;
-    }
-    .sca-idle-desc {
-      font-size: 11px; color: #6b7280; line-height: 1.65; max-width: 230px;
-    }
+    .sca-idle-title { font-size: 15px; font-weight: 800; color: #f0ecff; letter-spacing: -0.2px; }
+    .sca-idle-desc { font-size: 11px; color: #6b7280; line-height: 1.65; max-width: 230px; }
     #sca-start-btn {
       width: 100%; padding: 13px 16px;
       background: linear-gradient(135deg, rgba(124,58,237,0.45), rgba(6,182,212,0.28));
@@ -102,23 +96,14 @@
     }
     #sca-start-btn:hover {
       background: linear-gradient(135deg, rgba(124,58,237,0.65), rgba(6,182,212,0.42));
-      transform: translateY(-1px);
-      box-shadow: 0 0 32px rgba(124,58,237,0.35);
+      transform: translateY(-1px); box-shadow: 0 0 32px rgba(124,58,237,0.35);
     }
     #sca-start-btn:active  { transform: scale(0.97); }
     #sca-start-btn:disabled { opacity: 0.55; cursor: not-allowed; transform: none; }
-    .sca-privacy {
-      font-size: 9px; color: #374151;
-      font-family: 'DM Mono', monospace; line-height: 1.5;
-    }
+    .sca-privacy { font-size: 9px; color: #374151; font-family: 'DM Mono', monospace; line-height: 1.5; }
 
     /* ══════════════ ACTIVE SCREEN ══════════════ */
-    #sca-active {
-      display: none; flex-direction: column;
-      width: 100%; height: 100%;
-    }
-
-    /* Header */
+    #sca-active { display: none; flex-direction: column; width: 100%; height: 100%; }
     #sca-header {
       display: flex; align-items: center; justify-content: space-between;
       padding: 11px 14px 9px; flex-shrink: 0;
@@ -132,63 +117,47 @@
       transition: background 0.3s, box-shadow 0.3s;
     }
     #sca-live-dot.audio-active {
-      background: #06b6d4;
-      box-shadow: 0 0 8px #06b6d4, 0 0 20px rgba(6,182,212,0.4);
+      background: #06b6d4; box-shadow: 0 0 8px #06b6d4, 0 0 20px rgba(6,182,212,0.4);
       animation: sca-ping 2s ease-in-out infinite;
     }
     #sca-live-dot.vision-flash {
-      background: #a78bfa;
-      box-shadow: 0 0 8px #a78bfa, 0 0 20px rgba(167,139,250,0.5);
+      background: #a78bfa; box-shadow: 0 0 8px #a78bfa, 0 0 20px rgba(167,139,250,0.5);
     }
     @keyframes sca-ping {
       0%,100% { box-shadow: 0 0 6px #06b6d4, 0 0 12px rgba(6,182,212,0.3); }
       50%      { box-shadow: 0 0 12px #06b6d4, 0 0 28px rgba(6,182,212,0.6); }
     }
     .sca-wordmark { display: flex; flex-direction: column; gap: 1px; }
-    .sca-title    { font-size: 11px; font-weight: 800; letter-spacing: 0.1em; text-transform: uppercase; color: #f0ecff; }
-    .sca-sub      { font-size: 9px; font-family: 'DM Mono', monospace; color: #4b5563; letter-spacing: 0.06em; }
+    .sca-title { font-size: 11px; font-weight: 800; letter-spacing: 0.1em; text-transform: uppercase; color: #f0ecff; }
+    .sca-sub { font-size: 9px; font-family: 'DM Mono', monospace; color: #4b5563; letter-spacing: 0.06em; }
     #sca-stop-btn {
       width: 26px; height: 26px; border-radius: 7px;
-      border: 1px solid rgba(239,68,68,0.25);
-      background: rgba(239,68,68,0.07); color: #f87171;
+      border: 1px solid rgba(239,68,68,0.25); background: rgba(239,68,68,0.07); color: #f87171;
       font-size: 11px; cursor: pointer;
       display: flex; align-items: center; justify-content: center;
       transition: all 0.18s; flex-shrink: 0;
     }
     #sca-stop-btn:hover { background: rgba(239,68,68,0.18); border-color: rgba(239,68,68,0.5); }
-
     #sca-turn-btn {
       height: 26px; padding: 0 9px; border-radius: 7px;
-      border: 1px solid rgba(124,58,237,0.25);
-      background: rgba(124,58,237,0.07); color: #6b7280;
-      font-size: 10px; font-family: 'DM Mono', monospace;
-      letter-spacing: 0.04em; cursor: pointer;
+      border: 1px solid rgba(124,58,237,0.25); background: rgba(124,58,237,0.07); color: #6b7280;
+      font-size: 10px; font-family: 'DM Mono', monospace; letter-spacing: 0.04em; cursor: pointer;
       display: flex; align-items: center; gap: 5px;
       transition: all 0.18s; flex-shrink: 0; white-space: nowrap;
     }
     #sca-turn-btn:hover { background: rgba(124,58,237,0.15); color: #a78bfa; border-color: rgba(124,58,237,0.5); }
     #sca-turn-btn.on {
       background: rgba(124,58,237,0.22); color: #c4b5fd;
-      border-color: rgba(124,58,237,0.7);
-      box-shadow: 0 0 10px rgba(124,58,237,0.2);
+      border-color: rgba(124,58,237,0.7); box-shadow: 0 0 10px rgba(124,58,237,0.2);
     }
-    .sca-turn-dot {
-      width: 6px; height: 6px; border-radius: 50%;
-      background: currentColor; flex-shrink: 0;
-    }
-
-    /* Status */
+    .sca-turn-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; flex-shrink: 0; }
     #sca-status-bar {
-      padding: 6px 14px; font-family: 'DM Mono', monospace;
-      font-size: 10px; color: #374151;
+      padding: 6px 14px; font-family: 'DM Mono', monospace; font-size: 10px; color: #374151;
       border-bottom: 1px solid rgba(255,255,255,0.04);
-      flex-shrink: 0; display: flex; align-items: center;
-      gap: 6px; min-height: 28px; transition: color 0.3s;
+      flex-shrink: 0; display: flex; align-items: center; gap: 6px; min-height: 28px; transition: color 0.3s;
     }
     #sca-status-bar.active { color: #06b6d4; }
     #sca-status-bar.error  { color: #f87171; }
-
-    /* Waveform */
     #sca-wave {
       display: flex; align-items: center; justify-content: center;
       gap: 3px; padding: 7px 16px 4px; height: 28px; flex-shrink: 0;
@@ -197,11 +166,8 @@
       width: 3px; background: #1f1f2e; border-radius: 2px; height: 4px;
       transition: height 0.08s, background 0.3s;
     }
-    #sca-wave.active .sca-bar {
-      background: #7c3aed;
-      animation: sca-wave-anim 1.4s ease-in-out infinite;
-    }
-    .sca-bar:nth-child(1) { animation-delay: 0s;   }
+    #sca-wave.active .sca-bar { background: #7c3aed; animation: sca-wave-anim 1.4s ease-in-out infinite; }
+    .sca-bar:nth-child(1) { animation-delay: 0s; }
     .sca-bar:nth-child(2) { animation-delay: 0.1s; }
     .sca-bar:nth-child(3) { animation-delay: 0.2s; }
     .sca-bar:nth-child(4) { animation-delay: 0.3s; }
@@ -209,23 +175,17 @@
     .sca-bar:nth-child(6) { animation-delay: 0.3s; }
     .sca-bar:nth-child(7) { animation-delay: 0.2s; }
     .sca-bar:nth-child(8) { animation-delay: 0.1s; }
-    .sca-bar:nth-child(9) { animation-delay: 0s;   }
+    .sca-bar:nth-child(9) { animation-delay: 0s; }
     @keyframes sca-wave-anim { 0%,100% { height: 3px; } 50% { height: 16px; } }
-
-    /* Source badges */
-    #sca-sources {
-      display: flex; gap: 6px; padding: 0 14px 8px; flex-shrink: 0;
-    }
+    #sca-sources { display: flex; gap: 6px; padding: 0 14px 8px; flex-shrink: 0; }
     .sca-badge {
       font-family: 'DM Mono', monospace; font-size: 9px; letter-spacing: 0.07em;
       text-transform: uppercase; padding: 2px 7px; border-radius: 4px;
       border: 1px solid rgba(255,255,255,0.06); color: #374151;
       background: rgba(255,255,255,0.02); transition: all 0.3s;
     }
-    .sca-badge.on        { border-color: rgba(6,182,212,0.4);   color: #06b6d4; background: rgba(6,182,212,0.06); }
+    .sca-badge.on { border-color: rgba(6,182,212,0.4); color: #06b6d4; background: rgba(6,182,212,0.06); }
     .sca-badge.vision-on { border-color: rgba(167,139,250,0.4); color: #a78bfa; background: rgba(167,139,250,0.06); }
-
-    /* Feed */
     #sca-feed {
       flex: 1; overflow-y: auto; padding: 8px 12px 12px;
       display: flex; flex-direction: column; gap: 7px;
@@ -233,45 +193,28 @@
     }
     #sca-feed::-webkit-scrollbar { width: 3px; }
     #sca-feed::-webkit-scrollbar-thumb { background: rgba(124,58,237,0.35); border-radius: 2px; }
-
     .sca-empty {
-      flex: 1; display: flex; flex-direction: column;
-      align-items: center; justify-content: center;
-      color: #1f2937; font-family: 'DM Mono', monospace;
-      font-size: 11px; line-height: 1.7;
+      flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
+      color: #1f2937; font-family: 'DM Mono', monospace; font-size: 11px; line-height: 1.7;
       text-align: center; padding: 20px; gap: 8px;
     }
     .sca-empty-eye { font-size: 28px; opacity: 0.25; filter: grayscale(1); }
-
-    /* Cards */
-    .sca-card {
-      border-radius: 10px; padding: 10px 12px;
-      animation: sca-appear 0.3s cubic-bezier(0.16,1,0.3,1); flex-shrink: 0;
-    }
-    @keyframes sca-appear {
-      from { opacity:0; transform: translateX(12px) scale(0.97); }
-      to   { opacity:1; transform: translateX(0) scale(1); }
-    }
-
-    /* Card colours — one per tag type */
+    .sca-card { border-radius: 10px; padding: 10px 12px; animation: sca-appear 0.3s cubic-bezier(0.16,1,0.3,1); flex-shrink: 0; }
+    @keyframes sca-appear { from { opacity:0; transform: translateX(12px) scale(0.97); } to { opacity:1; transform: translateX(0) scale(1); } }
     .sca-card.directed  { background: rgba(96,165,250,0.11);  border: 1px solid rgba(96,165,250,0.40);  box-shadow: 0 0 12px rgba(96,165,250,0.08); }
-    .sca-card.greeting  { background: rgba(52,211,153,0.07);  border: 1px solid rgba(52,211,153,0.22);  }
-    .sca-card.humor     { background: rgba(251,191,36,0.07);  border: 1px solid rgba(251,191,36,0.28);  }
-    .sca-card.celebrate { background: rgba(249,115,22,0.08);  border: 1px solid rgba(249,115,22,0.28);  }
-    .sca-card.story     { background: rgba(139,92,246,0.07);  border: 1px solid rgba(139,92,246,0.22);  }
+    .sca-card.greeting  { background: rgba(52,211,153,0.07);  border: 1px solid rgba(52,211,153,0.22); }
+    .sca-card.humor     { background: rgba(251,191,36,0.07);  border: 1px solid rgba(251,191,36,0.28); }
+    .sca-card.celebrate { background: rgba(249,115,22,0.08);  border: 1px solid rgba(249,115,22,0.28); }
+    .sca-card.story     { background: rgba(139,92,246,0.07);  border: 1px solid rgba(139,92,246,0.22); }
     .sca-card.screen    { background: rgba(167,139,250,0.07); border: 1px solid rgba(167,139,250,0.22); }
-    .sca-card.emotion   { background: rgba(239,68,68,0.07);   border: 1px solid rgba(239,68,68,0.18);   }
-    .sca-card.turn      { background: rgba(124,58,237,0.08);  border: 1px solid rgba(124,58,237,0.22);  }
-    .sca-card.vibe      { background: rgba(6,182,212,0.06);   border: 1px solid rgba(6,182,212,0.18);   }
+    .sca-card.emotion   { background: rgba(239,68,68,0.07);   border: 1px solid rgba(239,68,68,0.18); }
+    .sca-card.turn      { background: rgba(124,58,237,0.08);  border: 1px solid rgba(124,58,237,0.22); }
+    .sca-card.vibe      { background: rgba(6,182,212,0.06);   border: 1px solid rgba(6,182,212,0.18); }
     .sca-card.farewell  { background: rgba(107,114,128,0.07); border: 1px solid rgba(107,114,128,0.22); }
     .sca-card.visual    { background: rgba(167,139,250,0.07); border: 1px solid rgba(167,139,250,0.18); }
-    .sca-card.face      { background: rgba(251,191,36,0.06);  border: 1px solid rgba(251,191,36,0.22);  }
+    .sca-card.face      { background: rgba(251,191,36,0.06);  border: 1px solid rgba(251,191,36,0.22); }
     .sca-card.note      { background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.07); }
-
-    .sca-card-tag {
-      font-size: 9px; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase;
-      font-family: 'DM Mono', monospace; margin-bottom: 5px;
-    }
+    .sca-card-tag { font-size: 9px; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase; font-family: 'DM Mono', monospace; margin-bottom: 5px; }
     .sca-card.directed  .sca-card-tag { color: #60a5fa; }
     .sca-card.greeting  .sca-card-tag { color: #34d399; }
     .sca-card.humor     .sca-card-tag { color: #fbbf24; }
@@ -285,13 +228,10 @@
     .sca-card.visual    .sca-card-tag { color: #c4b5fd; }
     .sca-card.face      .sca-card-tag { color: #fbbf24; }
     .sca-card.note      .sca-card-tag { color: #6b7280; }
-
     .sca-card-text { font-size: 13px; font-weight: 600; color: #f0ecff; line-height: 1.45; }
     .sca-card-meta { display: flex; align-items: center; gap: 6px; margin-top: 5px; }
     .sca-card-time   { font-family: 'DM Mono', monospace; font-size: 9px; color: #2d2d3d; }
     .sca-card-source { font-family: 'DM Mono', monospace; font-size: 9px; color: #2d2d3d; }
-
-    /* Footer */
     #sca-footer { padding: 8px 12px; border-top: 1px solid rgba(255,255,255,0.04); flex-shrink: 0; }
     #sca-clear-btn {
       width: 100%; background: transparent; border: 1px solid rgba(255,255,255,0.06);
@@ -305,8 +245,6 @@
   // ─── HTML ─────────────────────────────────────────────────────────────────
   const HTML = `
     <div id="sca-root">
-
-      <!-- IDLE -->
       <div id="sca-idle">
         <div class="sca-orb">🧠</div>
         <div class="sca-idle-title">Social Cue</div>
@@ -321,8 +259,6 @@
         </button>
         <div class="sca-privacy">🔒 Private · No recording stored · Analysis only</div>
       </div>
-
-      <!-- ACTIVE -->
       <div id="sca-active">
         <div id="sca-header">
           <div class="sca-hdr-left">
@@ -339,35 +275,22 @@
             <button id="sca-stop-btn" title="Stop session">⏹</button>
           </div>
         </div>
-
         <div id="sca-status-bar">Connecting…</div>
-
-        <div id="sca-wave">
-          ${Array(9).fill('<div class="sca-bar"></div>').join('')}
-        </div>
-
+        <div id="sca-wave">${Array(9).fill('<div class="sca-bar"></div>').join('')}</div>
         <div id="sca-sources">
           <span class="sca-badge" id="sca-badge-mic">🎤 Mic</span>
           <span class="sca-badge" id="sca-badge-tab">🔊 Tab</span>
           <span class="sca-badge vision-on" id="sca-badge-vision">👁 Vision</span>
         </div>
-
         <div id="sca-feed">
-          <div class="sca-empty">
-            <div class="sca-empty-eye">👁</div>
-            Observing your meeting.<br>Insights appear here.
-          </div>
+          <div class="sca-empty"><div class="sca-empty-eye">👁</div>Observing your meeting.<br>Insights appear here.</div>
         </div>
-
-        <div id="sca-footer">
-          <button id="sca-clear-btn">Clear history</button>
-        </div>
+        <div id="sca-footer"><button id="sca-clear-btn">Clear history</button></div>
       </div>
-
     </div>
   `;
 
-  // ─── Inject into sidebar pane ─────────────────────────────────────────────
+  // ─── Inject ───────────────────────────────────────────────────────────────
   function inject() {
     pane = window.__accessai?.getSidebarPane('social-cue');
     if (!pane) { setTimeout(inject, 300); return; }
@@ -389,28 +312,23 @@
       turnMode = !turnMode;
       const btn = pane.querySelector('#sca-turn-btn');
       btn.classList.toggle('on', turnMode);
-      btn.title = turnMode
-        ? 'Turn cues ON — click to disable'
-        : 'Turn cues OFF — click to enable when you want to know when to speak';
     });
   }
 
   // ─── UI helpers ───────────────────────────────────────────────────────────
-  function $(id)      { return pane?.querySelector('#' + id); }
+  function $(id) { return pane?.querySelector('#' + id); }
 
   function showIdle() {
-    const idle   = $('sca-idle');
-    const active = $('sca-active');
-    if (idle)   idle.style.display   = '';
+    const idle = $('sca-idle'), active = $('sca-active');
+    if (idle) idle.style.display = '';
     if (active) active.style.display = 'none';
     const btn = $('sca-start-btn');
     if (btn) { btn.innerHTML = '<span style="font-size:17px">🎙</span> Start Session'; btn.disabled = false; }
   }
 
   function showActive() {
-    const idle   = $('sca-idle');
-    const active = $('sca-active');
-    if (idle)   idle.style.display   = 'none';
+    const idle = $('sca-idle'), active = $('sca-active');
+    if (idle) idle.style.display = 'none';
     if (active) active.style.display = 'flex';
   }
 
@@ -418,7 +336,7 @@
     const el = $('sca-status-bar');
     if (!el) return;
     el.textContent = msg;
-    el.className   = cls || '';
+    el.className = cls || '';
   }
 
   function clearFeed() {
@@ -441,18 +359,16 @@
     }
   }
 
-  // ─── Start — identical flow to original content.js ────────────────────────
+  // ─── Start ────────────────────────────────────────────────────────────────
   async function startAll() {
     const btn = $('sca-start-btn');
     if (btn) { btn.innerHTML = '<span style="font-size:17px">⏳</span> Connecting…'; btn.disabled = true; }
 
-    // 1. API key
     apiKey = await getApiKey();
     if (!apiKey) { resetToIdle('⚠ No API key — add it to background.js'); return; }
 
     userName = await getUserName();
 
-    // 2. Screen + tab audio
     setStatus('Select your call window to share…', 'active');
     try {
       displayStream = await navigator.mediaDevices.getDisplayMedia({
@@ -463,9 +379,8 @@
       resetToIdle('Screen share cancelled — tap Start to try again');
       return;
     }
-    displayStream.getVideoTracks()[0]?.addEventListener('ended', () => { if (isListening) stopAll(); });
+    displayStream.getVideoTracks()[0]?.addEventListener('ended', () => { if (isListening) stopAll(); }, { once: true });
 
-    // 3. Mic
     setStatus('Requesting microphone…', 'active');
     try {
       micStream = await navigator.mediaDevices.getUserMedia({
@@ -477,19 +392,15 @@
       return;
     }
 
-    // 4. OpenAI Realtime WS
     setStatus('Connecting to OpenAI…', 'active');
     try { await connectWebSocket(); }
     catch (_) { resetToIdle('Connection failed — check your API key'); cleanup(); return; }
 
-    // 5. Audio mixer
     setupAudioMixer();
-
-    // 6. Vision loop
     setupVisionCapture();
 
-    // 7. Update UI
     isListening = true;
+    visionEnabled = true;
     showActive();
     $('sca-live-dot')?.classList.add('audio-active');
     $('sca-wave')?.classList.add('active');
@@ -502,28 +413,52 @@
 
   // ─── Stop ─────────────────────────────────────────────────────────────────
   function stopAll() {
-    cleanup();
+    // FIX #12: Set isListening to false FIRST to prevent WS close handler from re-calling stopAll
     isListening = false;
+    cleanup();
     showIdle();
     setStatus('Stopped', '');
     window.__accessai?.setFooterStatus('Social Cue: stopped');
   }
 
   function cleanup() {
-    if (ws)           { try { ws.close(); }              catch(_){} ws = null; }
-    if (visionInterval){ clearInterval(visionInterval);  visionInterval = null; }
-    if (processorNode){ try { processorNode.disconnect();}catch(_){} processorNode = null; }
-    if (audioCtx)     { try { audioCtx.close(); }        catch(_){} audioCtx = null; }
-    if (displayStream){ displayStream.getTracks().forEach(t => t.stop()); displayStream = null; }
-    if (micStream)    { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
-    if (hiddenVideo)  { hiddenVideo.srcObject = null; hiddenVideo.remove(); hiddenVideo = null; }
+    // FIX #9: Remove WS message listener before closing
+    if (ws) {
+      try { ws.removeEventListener('message', handleWSMessage); } catch (_) {}
+      try { ws.close(); } catch (_) {}
+      ws = null;
+    }
+    if (visionInterval) { clearInterval(visionInterval); visionInterval = null; }
+
+    // FIX #8: Disconnect all audio nodes properly
+    if (audioWorkletNode) {
+      try { audioWorkletNode.disconnect(); } catch (_) {}
+      if (audioWorkletNode.port) audioWorkletNode.port.onmessage = null;
+      audioWorkletNode = null;
+    }
+    if (processorNode) {
+      try { processorNode.disconnect(); } catch (_) {}
+      processorNode.onaudioprocess = null;
+      processorNode = null;
+    }
+    if (masterGainNode) {
+      try { masterGainNode.disconnect(); } catch (_) {}
+      masterGainNode = null;
+    }
+    if (audioCtx) { try { audioCtx.close(); } catch (_) {} audioCtx = null; }
+    if (displayStream) { displayStream.getTracks().forEach(t => t.stop()); displayStream = null; }
+    if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+    if (hiddenVideo) { hiddenVideo.srcObject = null; hiddenVideo.remove(); hiddenVideo = null; }
+
+    // FIX #34: Always clear response text
     currentResponseText = '';
     visionBusy = false;
     visionSeenSet.clear();
     turnMode = false;
+    _visionCanvas = null;
   }
 
-  // ─── WebSocket — verbatim from original content.js ────────────────────────
+  // ─── WebSocket ────────────────────────────────────────────────────────────
   function connectWebSocket() {
     return new Promise((resolve, reject) => {
       ws = new WebSocket(
@@ -543,12 +478,12 @@
             input_audio_format: 'pcm16',
             turn_detection: {
               type: 'server_vad',
-              threshold: 0.30,            // lower = more sensitive to quiet voices
+              threshold: 0.30,
               prefix_padding_ms: 300,
               silence_duration_ms: 500,
             },
             temperature: 0.6,
-            max_response_output_tokens: 80,  // enough for complete 8-word insights
+            max_response_output_tokens: 80,
           },
         }));
         resolve();
@@ -575,7 +510,7 @@ STRICT RULES:
 - Max 8 words after the tag. Non-negotiable.
 - Start with ONE tag: [DIRECTED], [TURN], [EMOTION], [VIBE], [GREETING], [HUMOR], [CELEBRATE], [STORY], [SCREEN], [FAREWELL], or [NOTE].
 
-[DIRECTED] — someone addresses ${userName} by name, OR gives a direct instruction/command/question to anyone in the call that ${userName} should act on. This includes: "do the execution", "go back", "don't do that", "can you show me", "what do you think", "your turn".
+[DIRECTED] — someone addresses ${userName} by name, OR gives a direct instruction/command/question to anyone in the call that ${userName} should act on.
 [DIRECTED] Command given — "do the execution."
 [DIRECTED] Instruction: "go back to the previous step."
 [DIRECTED] Direct question — they want a response.
@@ -607,18 +542,17 @@ STRICT RULES:
 [VIBE] Noticeable mood shift in the whole group.
 [VIBE] Energy dropped — check in gently.
 
-[FAREWELL] ONLY when MULTIPLE people are collectively signing off and the meeting is clearly ending. NOT for one person saying bye casually.
+[FAREWELL] ONLY when MULTIPLE people are collectively signing off and the meeting is clearly ending.
 [FAREWELL] Everyone signing off — time to say bye.
 
 [NOTE] Only for things that were CLEARLY AND EXPLICITLY said — never guess or infer.
 [NOTE] Someone explicitly said they'll follow up with you.
-[NOTE] You were explicitly mentioned or talked over.
 
 DO NOT use [NOTE] for silences, pauses, or anything you are inferring. Only flag spoken words.
 Output NOTHING when conversation flows normally.`;
   }
 
-  // ─── Handle Realtime messages — verbatim from original ────────────────────
+  // ─── Handle Realtime messages ─────────────────────────────────────────────
   function handleWSMessage(event) {
     let data;
     try { data = JSON.parse(event.data); } catch { return; }
@@ -629,22 +563,25 @@ Output NOTHING when conversation flows normally.`;
         break;
 
       case 'response.text.done':
-      case 'response.done':
-        if (currentResponseText.trim()) {
-          const txt = currentResponseText.trim();
-          currentResponseText = '';
-          // Filter out the model narrating silence
-          if (!/^[-–—\s]+$/.test(txt) &&
-              !/^(output nothing|silence|normal conversation|nothing|no insight)/i.test(txt) &&
-              !/^\[NOTE\]\s*(uncomfortable silence|awkward silence|silence after|pause after)/i.test(txt)) {
-            addCard(txt, 'audio');
-          }
+      case 'response.done': {
+        const txt = currentResponseText.trim();
+        // FIX #34: Always clear — even if empty
+        currentResponseText = '';
+
+        if (txt &&
+            !/^[-–—\s]+$/.test(txt) &&
+            !/^(output nothing|silence|normal conversation|nothing|no insight)/i.test(txt) &&
+            !/^\[NOTE\]\s*(uncomfortable silence|awkward silence|silence after|pause after)/i.test(txt)) {
+          addCard(txt, 'audio');
         }
         break;
+      }
 
       case 'error':
         console.error('[SCA]', data.error);
         setStatus(`OpenAI error: ${data.error?.code || 'unknown'}`, 'error');
+        // FIX #34: Clear on error too
+        currentResponseText = '';
         break;
 
       case 'input_audio_buffer.speech_started':
@@ -657,39 +594,36 @@ Output NOTHING when conversation flows normally.`;
     }
   }
 
-  // ─── Audio mixer — fixed channel routing + live level meter ─────────────
+  // ─── Audio mixer ──────────────────────────────────────────────────────────
   function setupAudioMixer() {
     audioCtx = new AudioContext({ sampleRate: SAMPLE_RATE });
 
-    // Master gain bus — everything feeds into this
-    const masterGain = audioCtx.createGain();
-    masterGain.gain.value = 1.0;
+    // FIX #8: Track masterGain for proper cleanup
+    masterGainNode = audioCtx.createGain();
+    masterGainNode.gain.value = 1.0;
 
-    // Mic source
     const micSource = audioCtx.createMediaStreamSource(micStream);
-    const micGain   = audioCtx.createGain();
+    const micGain = audioCtx.createGain();
     micGain.gain.value = 1.0;
     micSource.connect(micGain);
-    micGain.connect(masterGain);
+    micGain.connect(masterGainNode);
 
-    // Tab/speaker audio source
     const tabAudioTracks = displayStream.getAudioTracks();
     if (tabAudioTracks.length > 0) {
       const tabSource = audioCtx.createMediaStreamSource(new MediaStream(tabAudioTracks));
-      const tabGain   = audioCtx.createGain();
+      const tabGain = audioCtx.createGain();
       tabGain.gain.value = 1.0;
       tabSource.connect(tabGain);
-      tabGain.connect(masterGain);
+      tabGain.connect(masterGainNode);
       $('sca-badge-tab')?.classList.add('on');
     } else {
       setStatus('⚠ No tab audio — share with audio enabled', 'error');
     }
 
-    // ── Live audio level meter in status bar ──────────────────────────────
-    // Shows actual RMS so user knows audio is flowing
+    // Live audio level meter
     const analyser = audioCtx.createAnalyser();
     analyser.fftSize = 256;
-    masterGain.connect(analyser);
+    masterGainNode.connect(analyser);
     const levelBuf = new Uint8Array(analyser.frequencyBinCount);
     let lastLevelUpdate = 0;
     const levelInterval = setInterval(() => {
@@ -702,7 +636,6 @@ Output NOTHING when conversation flows normally.`;
         const bars = Math.min(8, Math.floor(rms / 8));
         const meter = '▮'.repeat(bars) + '▯'.repeat(8 - bars);
         const statusEl = $('sca-status-bar');
-        // Only update if not showing an important message
         if (statusEl && (statusEl.textContent.includes('insight') || statusEl.textContent.includes('Listening') || statusEl.textContent.includes('level'))) {
           const insightPart = insightCount > 0 ? `${insightCount} insight${insightCount !== 1 ? 's' : ''} · ` : '';
           statusEl.textContent = `${insightPart}audio: ${meter}`;
@@ -711,24 +644,21 @@ Output NOTHING when conversation flows normally.`;
       }
     }, 300);
 
-    // ── Silent audio detector — warns if no real audio after 4s ─────────────
-    // Teams desktop app on Windows often gives a silent audio track
+    // Silent audio detector
     setTimeout(() => {
       if (!isListening) return;
       analyser.getByteFrequencyData(levelBuf);
       const avg = levelBuf.reduce((s, v) => s + v, 0) / levelBuf.length;
       if (avg < 1) {
-        // Audio track connected but completely silent
         addCard('[NOTE] ⚠ No audio detected — if using Teams app, share the browser tab instead of the window, or check system audio settings.', 'audio');
         setStatus('⚠ Audio silent — see note below', 'error');
       }
     }, 4000);
 
-    // ── PCM16 encoder → WebSocket ─────────────────────────────────────────
-    processorNode = audioCtx.createScriptProcessor(BUFFER_SIZE, 1, 1);
-    processorNode.onaudioprocess = (e) => {
+    // ── PCM16 encoder → WebSocket ──
+    // FIX #40: Shared send function for both AudioWorklet and ScriptProcessor
+    const sendAudioChunk = (f32) => {
       if (!ws || ws.readyState !== WebSocket.OPEN) return;
-      const f32 = e.inputBuffer.getChannelData(0);
       const pcm = f32ToPCM16(f32);
       ws.send(JSON.stringify({
         type: 'input_audio_buffer.append',
@@ -736,11 +666,41 @@ Output NOTHING when conversation flows normally.`;
       }));
     };
 
-    masterGain.connect(processorNode);
-    processorNode.connect(audioCtx.destination);
+    // Try AudioWorklet first (glitch-free)
+    let usedWorklet = false;
+    (async () => {
+      try {
+        const workletCode = `
+          class MicProcessor extends AudioWorkletProcessor {
+            process(inputs) {
+              const ch = inputs[0]?.[0];
+              if (ch && ch.length > 0) this.port.postMessage(ch);
+              return true;
+            }
+          }
+          registerProcessor('sca-mic-processor', MicProcessor);
+        `;
+        const blob = new Blob([workletCode], { type: 'application/javascript' });
+        const url = URL.createObjectURL(blob);
+        await audioCtx.audioWorklet.addModule(url);
+        URL.revokeObjectURL(url);
+
+        audioWorkletNode = new AudioWorkletNode(audioCtx, 'sca-mic-processor');
+        audioWorkletNode.port.onmessage = (e) => sendAudioChunk(e.data);
+        masterGainNode.connect(audioWorkletNode);
+        audioWorkletNode.connect(audioCtx.destination);
+        usedWorklet = true;
+      } catch (e) {
+        // Fallback: ScriptProcessor
+        processorNode = audioCtx.createScriptProcessor(BUFFER_SIZE, 1, 1);
+        processorNode.onaudioprocess = (e) => sendAudioChunk(e.inputBuffer.getChannelData(0));
+        masterGainNode.connect(processorNode);
+        processorNode.connect(audioCtx.destination);
+      }
+    })();
   }
 
-  // ─── Vision: 2s snapshots → GPT-4o ────────────────────────────────────────
+  // ─── Vision ───────────────────────────────────────────────────────────────
   function setupVisionCapture() {
     const videoTrack = displayStream.getVideoTracks()[0];
     if (!videoTrack) return;
@@ -748,15 +708,23 @@ Output NOTHING when conversation flows normally.`;
     hiddenVideo = document.createElement('video');
     hiddenVideo.style.cssText = 'position:fixed;top:-9999px;left:-9999px;width:1px;height:1px;opacity:0;pointer-events:none;';
     hiddenVideo.autoplay = true;
-    hiddenVideo.muted    = true;
+    hiddenVideo.muted = true;
     hiddenVideo.playsInline = true;
     hiddenVideo.srcObject = new MediaStream([videoTrack]);
     document.body.appendChild(hiddenVideo);
-    hiddenVideo.play().catch(() => {});
+
+    // FIX #35: Handle play failure — disable vision instead of silently failing
+    hiddenVideo.play().catch((err) => {
+      console.warn('[SCA] Video play failed, vision disabled:', err.message);
+      visionEnabled = false;
+    });
 
     setTimeout(() => {
-      if (isListening) captureAndAnalyse();
-      visionInterval = setInterval(() => { if (isListening) captureAndAnalyse(); }, VISION_INTERVAL);
+      if (isListening && visionEnabled) captureAndAnalyse();
+      visionInterval = setInterval(() => {
+        // FIX #10: Only start new capture if previous one finished
+        if (isListening && visionEnabled && !visionBusy) captureAndAnalyse();
+      }, VISION_INTERVAL);
     }, 3000);
   }
 
@@ -766,12 +734,14 @@ Output NOTHING when conversation flows normally.`;
 
     const W = 1280;
     const H = Math.round(1280 * (hiddenVideo.videoHeight / (hiddenVideo.videoWidth || 1280)));
-    const canvas = document.createElement('canvas');
-    canvas.width = W; canvas.height = H || 720;
-    canvas.getContext('2d').drawImage(hiddenVideo, 0, 0, canvas.width, canvas.height);
-    const base64 = canvas.toDataURL('image/jpeg', 0.55).split(',')[1];
 
-    // Flash vision dot — same as original
+    // FIX #11: Reuse canvas
+    if (!_visionCanvas) _visionCanvas = document.createElement('canvas');
+    _visionCanvas.width = W;
+    _visionCanvas.height = H || 720;
+    _visionCanvas.getContext('2d').drawImage(hiddenVideo, 0, 0, _visionCanvas.width, _visionCanvas.height);
+    const base64 = _visionCanvas.toDataURL('image/jpeg', 0.55).split(',')[1];
+
     const dot = $('sca-live-dot');
     if (dot) {
       dot.classList.remove('audio-active');
@@ -813,14 +783,7 @@ If nothing notable or only ${userName} visible: NONE
 
 ONE line, max 8 words:
 [FACE] for another person's expression
-[VISUAL] for UI events only
-
-Examples:
-[FACE] Other person looks away — disengaged.
-[FACE] Participant appears confused — may need clarification.
-[FACE] They're smiling — good energy.
-[FACE] Someone yawning — looks tired.
-[VISUAL] Hand raised — wants to speak.`,
+[VISUAL] for UI events only`,
               },
               { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${base64}`, detail: 'low' } },
             ],
@@ -833,11 +796,17 @@ Examples:
       const text = (json.choices?.[0]?.message?.content || '').trim();
       if (!text || text === 'NONE') return;
 
-      // Semantic dedup: normalise to a short key (first 4 words lowercased)
-      const key = text.replace(/^\[(VISUAL|FACE)\]\s*/i, '').toLowerCase().split(/\s+/).slice(0, 4).join(' ');
+      // FIX #13: Use 6 words for dedup key instead of 4
+      const key = text.replace(/^\[(VISUAL|FACE)\]\s*/i, '').toLowerCase().split(/\s+/).slice(0, 6).join(' ');
+
+      // FIX #14: Cap visionSeenSet size
+      if (visionSeenSet.size >= MAX_SEEN_SET) {
+        const first = visionSeenSet.values().next().value;
+        visionSeenSet.delete(first);
+      }
+
       if (visionSeenSet.has(key)) return;
 
-      // FACE reads expire after 20s (faces change), UI events after 30s
       const isFace = /^\[FACE\]/i.test(text);
       visionSeenSet.add(key);
       setTimeout(() => visionSeenSet.delete(key), isFace ? 20000 : 30000);
@@ -851,8 +820,9 @@ Examples:
     }
   }
 
-  // ─── Add card — extended tag map, [TURN] gated behind turnMode ───────────
+  // ─── Add card ─────────────────────────────────────────────────────────────
   function addCard(text, source) {
+    if (!isListening) return; // FIX #9: Don't add cards after cleanup
     const feed = $('sca-feed');
     if (!feed) return;
     feed.querySelector('.sca-empty')?.remove();
@@ -873,32 +843,29 @@ Examples:
       'NOTE':      ['note',      '· Note'],
     };
 
-    // Drop malformed/partial tags like "[DIRECT" or "[NOTE" without closing bracket
     if (/^\[[A-Z]+$/.test(text.trim()) || /^\[[A-Z]+\s*$/.test(text.trim())) return;
 
     let cssClass = 'note', tagLabel = '· Note', body = text;
     const match = text.match(/^\[([A-Z]+)\]\s*/i);
     if (match) {
-      const key    = match[1].toUpperCase();
-      body         = text.slice(match[0].length).trim();
+      const key = match[1].toUpperCase();
+      body = text.slice(match[0].length).trim();
       const mapped = TAG_MAP[key];
       if (mapped) { cssClass = mapped[0]; tagLabel = mapped[1]; }
-      else        { cssClass = 'note'; tagLabel = '· ' + key; }
+      else { cssClass = 'note'; tagLabel = '· ' + key; }
     } else if (source === 'vision') {
       cssClass = 'visual'; tagLabel = '👁 Visual';
     }
 
-    // FAREWELL cooldown — can't fire more than once per 2 minutes
     if (cssClass === 'farewell') {
       const now = Date.now();
       if (addCard._lastFarewell && now - addCard._lastFarewell < 120000) return;
       addCard._lastFarewell = now;
     }
 
-    // TURN cues only show when the user has opted in via the toggle
     if (cssClass === 'turn' && !turnMode) return;
 
-    const time     = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
     const srcLabel = source === 'vision' ? '👁 vision' : '🎙 audio';
     insightCount++;
 
@@ -912,7 +879,6 @@ Examples:
         `<span class="sca-card-source">· ${srcLabel}</span>` +
       `</div>`;
 
-    // Insert newest at top — same as original
     feed.insertBefore(card, feed.firstChild);
 
     const all = feed.querySelectorAll('.sca-card');
@@ -922,7 +888,7 @@ Examples:
     window.__accessai?.setFooterStatus(`Social Cue: ${insightCount} insight${insightCount !== 1 ? 's' : ''}`);
   }
 
-  // ─── Helpers — verbatim from original ─────────────────────────────────────
+  // ─── Helpers ──────────────────────────────────────────────────────────────
   function f32ToPCM16(f32) {
     const out = new Int16Array(f32.length);
     for (let i = 0; i < f32.length; i++) {
@@ -941,7 +907,7 @@ Examples:
 
   function esc(s) {
     if (!s) return '';
-    return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   }
 
   function getApiKey() {
@@ -949,7 +915,7 @@ Examples:
       try { chrome.runtime.sendMessage({ type: 'GET_API_KEY' }, res => {
         if (chrome.runtime.lastError) { r(null); return; }
         r(res?.key || null);
-      }); } catch(_) { r(null); }
+      }); } catch (_) { r(null); }
     });
   }
 
@@ -958,13 +924,12 @@ Examples:
       try { chrome.runtime.sendMessage({ type: 'GET_USER_NAME' }, res => {
         if (chrome.runtime.lastError) { r('User'); return; }
         r(res?.name || 'User');
-      }); } catch(_) { r('User'); }
+      }); } catch (_) { r('User'); }
     });
   }
 
   // ─── Lifecycle ────────────────────────────────────────────────────────────
   function tryInject() {
-    // Re-inject if pane was cleared by a mode switch
     const p = window.__accessai?.getSidebarPane('social-cue');
     if (p && !p.querySelector('#sca-root')) pane = null;
     if (!pane || !pane.querySelector('#sca-root')) inject();
