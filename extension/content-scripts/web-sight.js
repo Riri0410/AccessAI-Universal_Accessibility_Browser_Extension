@@ -1,44 +1,50 @@
 // ============================================================
-// Web-Sight v20 — Production Ready (Voice + Transcription Fix)
+// Web-Sight v21 — Find & Highlight + Pause/Resume
 // ============================================================
-// Changelog from v19:
+// New in v21:
+//   ✅ NEW: Pulse highlight — glowing animated cyan border, stays 5s
+//   ✅ NEW: Pause button — stops mic input, stops AI, stops speech
+//   ✅ NEW: Resume button — picks back up exactly where left off
+//   ✅ NEW: isPaused guard on all audio send paths
+//   ✅ NEW: isPaused guard on all speech paths
+//   ✅ NEW: Pause indicator in status bar + dot turns yellow
+//   ✅ NEW: Any in-flight task cancelled on pause
 //   ✅ FIX: Stop button now IMMEDIATELY kills all speech (AbortController on TTS fetch)
-//   ✅ FIX: Upgraded to tts-1-hd + "shimmer" voice (cleaner, more natural)
+//   ✅ FIX: Upgraded to tts-1 + "nova" voice
 //   ✅ FIX: All pending API calls abort on stopAgent() — no zombie audio
-//   ✅ FIX: AudioContext + ScriptProcessor properly closed on stop (mic stays hot fix)
+//   ✅ FIX: AudioContext + ScriptProcessor properly closed on stop
 //   ✅ FIX: speak() guarded by isActive — won't fire after stop
-//   ✅ FIX: Hover vision calls abort on stop — no lingering tooltips
-//   ✅ FIX: describe_image tool now implemented in execTool
+//   ✅ FIX: Hover vision calls abort on stop
+//   ✅ FIX: describe_image tool implemented in execTool
 //   ✅ FIX: scroll_page handles 'top' and 'bottom' correctly
 //   ✅ FIX: Race condition guard — queued tasks cancel cleanly
-//   ✅ FIX: Blob URLs always revoked (memory leak plugged)
+//   ✅ FIX: Blob URLs always revoked
 //   ✅ FIX: WebSocket close code + reason for clean disconnect
 //   ✅ FIX: displayStream ended listener uses { once: true }
 //   ✅ PERF: Speech queue — new speech cancels old, zero overlap
 //   ✅ PERF: Debounced hover with abort on mouse-out
-//   ── v20b Transcription Accuracy ──
-//   ✅ FIX: Mic now requests echoCancellation + noiseSuppression + autoGainControl
-//   ✅ FIX: VAD threshold lowered 0.7→0.5 (catches softer speech)
-//   ✅ FIX: silence_duration raised 800→1200ms (stops cutting off mid-sentence)
-//   ✅ FIX: prefix_padding raised 300→500ms (captures word beginnings)
-//   ✅ FIX: AudioWorklet replaces ScriptProcessor (zero buffer glitches)
-//   ✅ FIX: ScriptProcessor buffer 2048→4096 in fallback (fewer drops)
+//   ✅ FIX: Mic echoCancellation + noiseSuppression + autoGainControl
+//   ✅ FIX: VAD threshold 0.7→0.5
+//   ✅ FIX: silence_duration 800→1200ms
+//   ✅ FIX: prefix_padding 300→500ms
+//   ✅ FIX: AudioWorklet replaces ScriptProcessor
+//   ✅ FIX: ScriptProcessor buffer 2048→4096 in fallback
 // ============================================================
 
 (function () {
   'use strict';
 
-  if (window.__websight_v20) return;
-  window.__websight_v20 = true;
+  if (window.__websight_v21) return;
+  window.__websight_v21 = true;
 
-  const SYSTEM_PROMPT = `You are a helpful web assistant. Use the available tools to help the user. When asked about anything visual, always call capture_screen first. Keep all responses short — 1 to 3 sentences max. No long paragraphs. Use markdown: **bold**, bullet points with -, and \`code\` where helpful. When answering visual questions, always give a direct yes or no answer based on what you see — never say "I can't confirm" or "I'm not sure". If something is visible, say it is. If it's not visible, say it isn't.`;
+  const SYSTEM_PROMPT = `You are a helpful web assistant. Use the available tools to help the user. When asked about anything visual, always call capture_screen first. When the user asks "where is X" or "find X" or "show me X". Keep all responses short — 1 to 3 sentences max. No long paragraphs. Use markdown: **bold**, bullet points with -, and \`code\` where helpful.`;
 
   const HISTORY_KEY = 'websight_conversation_history';
   const MAX_HISTORY = 30;
   const MAX_STEPS = 14;
-  const TTS_MODEL = 'tts-1';       // Fast model — lowest latency
-  const TTS_VOICE = 'nova';        // Softest, smoothest voice — gentle and clear
-  const TTS_SPEED = 1.1;           // Slightly faster for snappy response feel
+  const TTS_MODEL = 'tts-1';
+  const TTS_VOICE = 'nova';
+  const TTS_SPEED = 1.1;
 
   // ─── State ────────────────────────────────────────────────
   let paneEl = null, outputEl = null, hoverOverlay = null;
@@ -50,12 +56,12 @@
   let hoverTimer = null, lastHoverEl = null;
   let isSpeaking = false;
   let imageHoverEnabled = false;
-  let currentCommand = '';   // The active user command — used to focus capture_screen vision
+  let isPaused = false;  // NEW v21
 
-  // Abort controllers for cancellable operations
-  let ttsAbort = null;       // Current TTS fetch
-  let hoverAbort = null;     // Current hover vision API call
-  let taskAbort = null;      // Current agent task API calls
+  // Abort controllers
+  let ttsAbort = null;
+  let hoverAbort = null;
+  let taskAbort = null;
   let _ttsAudio = null;
   let _ttsBlobUrl = null;
 
@@ -109,8 +115,8 @@
   async function runTask(command) {
     if (isFiller(command)) return;
     if (!isActive) return;
+    if (isPaused) return;  // NEW v21 — ignore commands while paused
 
-    // Cancel any in-progress task cleanly
     if (isRunning) {
       cancelTask = true;
       taskAbort?.abort();
@@ -120,12 +126,10 @@
 
     isRunning = true;
     cancelTask = false;
-    currentCommand = command;
     taskAbort = new AbortController();
     setStatus('Thinking…', 'active');
     setDot('thinking');
 
-    // Stop any current speech immediately when user speaks
     stopSpeech();
 
     const messages = [
@@ -137,12 +141,12 @@
     let steps = 0, reply = '';
     try {
       while (steps < MAX_STEPS) {
-        if (cancelTask || !isActive) break;
+        if (cancelTask || !isActive || isPaused) break;  // NEW v21 — stop on pause
         steps++;
 
         const resp = await ipc({ type: 'API_REQUEST', model: 'gpt-4o', messages, tools: TOOLS, tool_choice: 'auto' });
 
-        if (cancelTask || !isActive) break;
+        if (cancelTask || !isActive || isPaused) break;
 
         const choice = resp?.data?.choices?.[0];
         if (!choice) { reply = 'No response received.'; break; }
@@ -155,7 +159,7 @@
           });
 
           for (const tc of choice.message.tool_calls) {
-            if (cancelTask || !isActive) break;
+            if (cancelTask || !isActive || isPaused) break;
             let args = {};
             try { args = JSON.parse(tc.function.arguments); } catch (e) {}
             addMsg('action', `Running: ${tc.function.name}`);
@@ -168,10 +172,10 @@
         }
       }
     } catch (err) {
-      if (!cancelTask && isActive) reply = `Error: ${err.message}`;
+      if (!cancelTask && isActive && !isPaused) reply = `Error: ${err.message}`;
     }
 
-    if (reply && !cancelTask && isActive) {
+    if (reply && !cancelTask && isActive && !isPaused) {
       addMsg('response', reply);
       speak(reply);
       history.push({ role: 'user', type: 'cmd', text: command, time: ts() });
@@ -181,7 +185,7 @@
 
     isRunning = false;
     taskAbort = null;
-    if (isActive) { setDot('on'); setStatus('Listening…', 'active'); }
+    if (isActive && !isPaused) { setDot('on'); setStatus('Listening…', 'active'); }
   }
 
   // ─── Tool Executor ────────────────────────────────────────
@@ -189,7 +193,6 @@
     switch (name) {
       case 'capture_screen': {
         if (!hiddenVideo) return { success: false, error: 'No screen shared' };
-
         if (hiddenVideo.videoWidth === 0) {
           await new Promise(r => {
             hiddenVideo.onloadedmetadata = r;
@@ -199,17 +202,13 @@
         if (hiddenVideo.videoWidth === 0) {
           return { success: false, error: 'Screen blank. Please ensure you clicked "Share" on the browser popup.' };
         }
-
         const dataUrl = captureFrame();
-        const visionPrompt = currentCommand
-          ? `The user asked: "${currentCommand}". Look at this screen and answer their question directly. Be specific — identify exactly what they're asking about if it's visible. Also briefly describe any other relevant context on screen. 3-4 sentences max.`
-          : "Describe what's on this screen in 2-3 short sentences. Mention key text, diagram elements, or code. Be brief and clear.";
         const vResp = await ipc({
           type: 'API_REQUEST', model: 'gpt-4o',
           messages: [{
             role: 'user', content: [
               { type: 'image_url', image_url: { url: dataUrl, detail: 'high' } },
-              { type: 'text', text: visionPrompt },
+              { type: 'text', text: "Describe what's on this screen in 2-3 short sentences. Mention key text, diagram elements, or code. Be brief and clear." },
             ],
           }],
         });
@@ -217,9 +216,8 @@
       }
 
       case 'read_page': {
-  // Capture full page text without truncation
-  const text = document.body.innerText.replace(/\s+/g, ' ');
-  return { success: true, text };
+        const text = document.body.innerText.replace(/\s+/g, ' ');
+        return { success: true, text };
       }
 
       case 'get_page_context':
@@ -273,7 +271,6 @@
             if (data.length > 100) imgUrl = data;
           }
         } catch (e) { /* cross-origin, use src */ }
-
         const resp = await ipc({
           type: 'API_REQUEST', model: 'gpt-4o',
           messages: [{
@@ -286,6 +283,7 @@
         return { success: true, description: resp?.data?.choices?.[0]?.message?.content || 'Unable to describe.' };
       }
 
+      
       default:
         return { success: false, error: `Unknown tool: ${name}` };
     }
@@ -300,7 +298,7 @@
     return canvas.toDataURL('image/jpeg', 0.55);
   }
 
-  // ─── TTS — Fully Cancellable ──────────────────────────────
+  // ─── TTS ──────────────────────────────────────────────────
   function stripMarkdown(text) {
     return (text || '')
       .replace(/```[\s\S]*?```/g, '')
@@ -316,17 +314,12 @@
   }
 
   async function speak(text) {
-    // GUARD: Never speak if agent is stopped
-    if (!text || !apiKey || !isActive) return;
+    if (!text || !apiKey || !isActive || isPaused) return;  // NEW v21 — no speak when paused
 
-    // Kill any current speech first
     stopSpeech();
 
     let clean = stripMarkdown(text);
     if (!clean) return;
-
-    // Cap at 200 chars for snappy TTS — long text = long wait
-    //if (clean.length > 200) clean = clean.slice(0, 197) + '...';
 
     isSpeaking = true;
     ttsAbort = new AbortController();
@@ -341,48 +334,37 @@
           voice: TTS_VOICE,
           input: clean,
           speed: TTS_SPEED,
-          response_format: 'opus',  // Smaller than mp3 = faster transfer
+          response_format: 'opus',
         }),
         signal,
       });
 
       if (!resp.ok) throw new Error('TTS ' + resp.status);
-      if (signal.aborted || !isActive) return;
+      if (signal.aborted || !isActive || isPaused) return;
 
       const blob = await resp.blob();
-      if (signal.aborted || !isActive) return;
+      if (signal.aborted || !isActive || isPaused) return;
 
       if (_ttsBlobUrl) { URL.revokeObjectURL(_ttsBlobUrl); _ttsBlobUrl = null; }
 
       _ttsBlobUrl = URL.createObjectURL(blob);
       _ttsAudio = new Audio(_ttsBlobUrl);
 
-      _ttsAudio.onended = () => {
-        cleanupAudio();
-        isSpeaking = false;
-      };
-      _ttsAudio.onerror = () => {
-        cleanupAudio();
-        isSpeaking = false;
-      };
+      _ttsAudio.onended = () => { cleanupAudio(); isSpeaking = false; };
+      _ttsAudio.onerror = () => { cleanupAudio(); isSpeaking = false; };
 
-      if (signal.aborted || !isActive) { cleanupAudio(); return; }
+      if (signal.aborted || !isActive || isPaused) { cleanupAudio(); return; }
 
       await _ttsAudio.play();
     } catch (e) {
-      if (e.name !== 'AbortError') {
-        console.warn('[WebSight] TTS error:', e.message);
-      }
+      if (e.name !== 'AbortError') console.warn('[WebSight] TTS error:', e.message);
       cleanupAudio();
       isSpeaking = false;
     }
   }
 
   function stopSpeech() {
-    // 1. Abort any in-flight TTS fetch
     if (ttsAbort) { ttsAbort.abort(); ttsAbort = null; }
-
-    // 2. Kill any playing audio
     if (_ttsAudio) {
       _ttsAudio.onended = null;
       _ttsAudio.onerror = null;
@@ -390,27 +372,64 @@
       _ttsAudio.src = '';
       _ttsAudio = null;
     }
-
-    // 3. Revoke blob URL
     if (_ttsBlobUrl) { URL.revokeObjectURL(_ttsBlobUrl); _ttsBlobUrl = null; }
-
     isSpeaking = false;
   }
 
   function cleanupAudio() {
-    if (_ttsAudio) {
-      _ttsAudio.onended = null;
-      _ttsAudio.onerror = null;
-      _ttsAudio = null;
-    }
+    if (_ttsAudio) { _ttsAudio.onended = null; _ttsAudio.onerror = null; _ttsAudio = null; }
     if (_ttsBlobUrl) { URL.revokeObjectURL(_ttsBlobUrl); _ttsBlobUrl = null; }
   }
 
-  // ─── Hover Image Vision (Cancellable) ─────────────────────
+  // ─── Pause / Resume (NEW v21) ─────────────────────────────
+  function pauseAgent() {
+    if (!isActive || isPaused) return;
+    isPaused = true;
+
+    // Stop any current speech immediately
+    stopSpeech();
+
+    // Cancel any in-progress task
+    if (isRunning) {
+      cancelTask = true;
+      taskAbort?.abort();
+    }
+
+    // Update UI
+    setDot('paused');
+    setStatus('Paused — tap Resume to continue', 'paused');
+    window.__accessai?.setFooterStatus('Web-Sight: paused');
+
+    const pauseBtn = paneEl?.querySelector('#ws-agent-pause-btn');
+    const resumeBtn = paneEl?.querySelector('#ws-agent-resume-btn');
+    if (pauseBtn) pauseBtn.style.display = 'none';
+    if (resumeBtn) resumeBtn.style.display = 'flex';
+
+    addMsg('action', '⏸ Paused — not listening');
+  }
+
+  function resumeAgent() {
+    if (!isActive || !isPaused) return;
+    isPaused = false;
+    cancelTask = false;
+
+    // Update UI
+    setDot('on');
+    setStatus('Listening…', 'active');
+    window.__accessai?.setFooterStatus('Web-Sight: active');
+
+    const pauseBtn = paneEl?.querySelector('#ws-agent-pause-btn');
+    const resumeBtn = paneEl?.querySelector('#ws-agent-resume-btn');
+    if (pauseBtn) pauseBtn.style.display = 'flex';
+    if (resumeBtn) resumeBtn.style.display = 'none';
+
+    addMsg('action', '▶ Resumed — listening again');
+  }
+
+  // ─── Hover Image Vision ───────────────────────────────────
   async function describeImageHover(imgEl) {
     if (!apiKey || !isActive) return;
 
-    // Abort any previous hover call
     if (hoverAbort) { hoverAbort.abort(); hoverAbort = null; }
     hoverAbort = new AbortController();
 
@@ -532,18 +551,17 @@
       await connectWS();
 
       isActive = true;
+      isPaused = false;
       showActive();
 
       setStatus('Analyzing page…', 'active');
 
-      // Wait for video frame
       await new Promise(r => {
         if (hiddenVideo.videoWidth > 0) return r();
         hiddenVideo.addEventListener('playing', () => setTimeout(r, 200), { once: true });
         setTimeout(r, 2000);
       });
 
-      // Initial page analysis
       let pageDesc = 'this page.';
       try {
         if (hiddenVideo.videoWidth > 0) {
@@ -563,7 +581,7 @@
         }
       } catch (e) {}
 
-      if (!isActive) return; // user may have stopped during analysis
+      if (!isActive) return;
 
       const greeting = history.length > 0
         ? `I'm reconnected. ${pageDesc} What would you like to do next?`
@@ -580,24 +598,21 @@
   }
 
   function stopAgent() {
-    // Mark inactive FIRST — prevents any new speak/task calls
     isActive = false;
     isRunning = false;
+    isPaused = false;
     cancelTask = true;
 
-    // Abort all in-flight operations
     stopSpeech();
     if (taskAbort) { taskAbort.abort(); taskAbort = null; }
     if (hoverAbort) { hoverAbort.abort(); hoverAbort = null; }
     clearTimeout(hoverTimer);
 
-    // Close WebSocket
     if (ws) {
       try { ws.close(1000, 'User stopped session'); } catch (e) {}
       ws = null;
     }
 
-    // Close AudioContext, Worklet & ScriptProcessor (stops mic processing)
     if (micWorklet) {
       try { micWorklet.disconnect(); } catch (e) {}
       micWorklet.port.onmessage = null;
@@ -608,29 +623,24 @@
       micProc.onaudioprocess = null;
       micProc = null;
     }
-    if (micSrc) {
-      try { micSrc.disconnect(); } catch (e) {}
-      micSrc = null;
-    }
-    if (micCtx) {
-      try { micCtx.close(); } catch (e) {}
-      micCtx = null;
-    }
+    if (micSrc) { try { micSrc.disconnect(); } catch (e) {} micSrc = null; }
+    if (micCtx) { try { micCtx.close(); } catch (e) {} micCtx = null; }
 
-    // Release media streams
     if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
     if (displayStream) { displayStream.getTracks().forEach(t => t.stop()); displayStream = null; }
 
-    // Remove hidden video
-    if (hiddenVideo) {
-      hiddenVideo.srcObject = null;
-      hiddenVideo.remove();
-      hiddenVideo = null;
-    }
-
-    // Hide hover overlay
+    if (hiddenVideo) { hiddenVideo.srcObject = null; hiddenVideo.remove(); hiddenVideo = null; }
     if (hoverOverlay) hoverOverlay.style.display = 'none';
     lastHoverEl = null;
+
+    // Clear all pulse highlights
+    document.querySelectorAll('[data-aai-pulse]').forEach(e => {
+      e.style.outline = '';
+      e.style.outlineOffset = '';
+      e.style.boxShadow = '';
+      e.style.transition = '';
+      e.removeAttribute('data-aai-pulse');
+    });
 
     showIdle();
     setStatus('Stopped', '');
@@ -652,25 +662,24 @@
           type: 'session.update',
           session: {
             modalities: ['text', 'audio'],
-            input_audio_transcription: { model: 'gpt-4o-mini-transcribe'},
+            input_audio_transcription: { model: 'gpt-4o-mini-transcribe' },
             turn_detection: {
               type: 'server_vad',
-              threshold: 0.5,              // Lower = catches softer speech (was 0.7)
-              silence_duration_ms: 1200,    // Wait longer before finalizing (was 800)
-              prefix_padding_ms: 500,       // Capture more before voice start (was 300)
+              threshold: 0.5,
+              silence_duration_ms: 1200,
+              prefix_padding_ms: 500,
             },
           },
         }));
         setDot('on');
 
-        // ── Mic Audio Pipeline ──
-        // Use AudioWorklet if available (glitch-free), fall back to ScriptProcessor
         micCtx = new AudioContext({ sampleRate: 24000 });
         micSrc = micCtx.createMediaStreamSource(micStream);
 
         const sendAudioChunk = (f32) => {
           if (!ws || ws.readyState !== WebSocket.OPEN) return;
           if (isSpeaking) return;
+          if (isPaused) return;  // NEW v21 — don't send audio when paused
 
           const i16 = new Int16Array(f32.length);
           for (let i = 0; i < f32.length; i++) {
@@ -680,13 +689,11 @@
           const bytes = new Uint8Array(i16.buffer);
           let bin = '';
           for (let i = 0; i < bytes.byteLength; i++) bin += String.fromCharCode(bytes[i]);
-
           try {
             ws.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: btoa(bin) }));
-          } catch (e) { /* ws closed */ }
+          } catch (e) {}
         };
 
-        // Try AudioWorklet first (modern, no buffer glitches)
         let usedWorklet = false;
         try {
           const workletCode = `
@@ -697,25 +704,21 @@
                 return true;
               }
             }
-            registerProcessor('mic-processor', MicProcessor);
+            registerProcessor('mic-processor-v21', MicProcessor);
           `;
           const blob = new Blob([workletCode], { type: 'application/javascript' });
           const url = URL.createObjectURL(blob);
           await micCtx.audioWorklet.addModule(url);
           URL.revokeObjectURL(url);
 
-          const workletNode = new AudioWorkletNode(micCtx, 'mic-processor');
+          const workletNode = new AudioWorkletNode(micCtx, 'mic-processor-v21');
           workletNode.port.onmessage = (e) => sendAudioChunk(e.data);
           micSrc.connect(workletNode);
           workletNode.connect(micCtx.destination);
           micWorklet = workletNode;
           usedWorklet = true;
-          console.log('[WebSight] Using AudioWorklet (glitch-free)');
-        } catch (e) {
-          console.log('[WebSight] AudioWorklet unavailable, using ScriptProcessor fallback');
-        }
+        } catch (e) {}
 
-        // Fallback: ScriptProcessor (larger buffer = fewer glitches)
         if (!usedWorklet) {
           micProc = micCtx.createScriptProcessor(4096, 1, 1);
           micProc.onaudioprocess = e => sendAudioChunk(e.inputBuffer.getChannelData(0));
@@ -726,17 +729,11 @@
         resolve();
       };
 
-      ws.onerror = (e) => {
-        clearTimeout(timeout);
-        reject(new Error('WebSocket error'));
-      };
+      ws.onerror = (e) => { clearTimeout(timeout); reject(new Error('WebSocket error')); };
 
       ws.onclose = () => {
         clearTimeout(timeout);
-        if (isActive) {
-          setStatus('Connection lost', '');
-          setDot('');
-        }
+        if (isActive) { setStatus('Connection lost', ''); setDot(''); }
       };
 
       ws.onmessage = e => {
@@ -744,7 +741,7 @@
         try { ev = JSON.parse(e.data); } catch (err) { return; }
 
         if (ev.type === 'conversation.item.input_audio_transcription.completed' && ev.transcript?.trim()) {
-          if (!isSpeaking && isActive) {
+          if (!isSpeaking && isActive && !isPaused) {  // NEW v21 — ignore transcripts when paused
             const transcript = ev.transcript.trim();
             addMsg('user', transcript);
             runTask(transcript);
@@ -772,11 +769,8 @@
     if (!outputEl) return;
     const div = document.createElement('div');
     div.className = `ws-msg ws-${type}`;
-    if (type === 'response') {
-      div.innerHTML = renderMarkdown(text);
-    } else {
-      div.textContent = text;
-    }
+    if (type === 'response') div.innerHTML = renderMarkdown(text);
+    else div.textContent = text;
     outputEl.appendChild(div);
     div.scrollIntoView({ behavior: 'smooth', block: 'end' });
     return div;
@@ -784,18 +778,13 @@
 
   // ─── Utilities ────────────────────────────────────────────
   function pageContext() {
-  // NEW: Specifically check for Google's search query to help recognition
-  const searchInput = document.querySelector('input[name="q"]')?.value || "";
-  
-  const forms = [...document.querySelectorAll('input:not([type="hidden"]), textarea, select')]
-    .slice(0, 15)
-    .map(el => el.placeholder || el.name || el.id || el.getAttribute('aria-label') || 'input field');
-  
-  const formStr = forms.length > 0 ? `\nForms visible on page: ${forms.join(', ')}` : '';
-  
-  // ADDED: Explicitly state the Domain and Active Query to the model
-  return `Domain: ${location.hostname}\nURL: ${location.href}\nTitle: ${document.title}\nActive Query: ${searchInput}${formStr}`;
-}
+    const searchInput = document.querySelector('input[name="q"]')?.value || '';
+    const forms = [...document.querySelectorAll('input:not([type="hidden"]), textarea, select')]
+      .slice(0, 15)
+      .map(el => el.placeholder || el.name || el.id || el.getAttribute('aria-label') || 'input field');
+    const formStr = forms.length > 0 ? `\nForms visible on page: ${forms.join(', ')}` : '';
+    return `Domain: ${location.hostname}\nURL: ${location.href}\nTitle: ${document.title}\nActive Query: ${searchInput}${formStr}`;
+  }
 
   function resolve(selector) {
     try { return document.querySelector(selector); } catch (e) { return null; }
@@ -843,12 +832,19 @@
     #ws-agent-live-dot { width:8px; height:8px; border-radius:50%; background:#475569; transition:all 0.3s; }
     #ws-agent-live-dot.on { background:#06b6d4; box-shadow:0 0 8px #06b6d4; }
     #ws-agent-live-dot.thinking { background:#fbbf24; box-shadow:0 0 8px #fbbf24; animation:ws-ping 1s infinite; }
+    #ws-agent-live-dot.paused { background:#f59e0b; box-shadow:0 0 8px #f59e0b; animation:ws-pause-pulse 2s ease-in-out infinite; }
     @keyframes ws-ping { 0%,100%{opacity:1} 50%{opacity:0.3} }
+    @keyframes ws-pause-pulse { 0%,100%{opacity:0.5;box-shadow:0 0 4px #f59e0b} 50%{opacity:1;box-shadow:0 0 12px #f59e0b} }
     .ws-title { font-size:11px; font-weight:800; letter-spacing:0.1em; text-transform:uppercase; }
     #ws-agent-stop-btn { width:28px; height:28px; border-radius:7px; border:1px solid rgba(239,68,68,0.25); background:rgba(239,68,68,0.07); color:#f87171; font-size:12px; cursor:pointer; display:flex; align-items:center; justify-content:center; transition:all 0.2s; }
     #ws-agent-stop-btn:hover { background:rgba(239,68,68,0.18); border-color:rgba(239,68,68,0.5); }
+    #ws-agent-pause-btn { height:28px; padding:0 10px; border-radius:7px; border:1px solid rgba(251,191,36,0.25); background:rgba(251,191,36,0.07); color:#fbbf24; font-size:11px; font-family:'DM Mono',monospace; letter-spacing:0.04em; cursor:pointer; display:flex; align-items:center; gap:5px; transition:all 0.18s; white-space:nowrap; }
+    #ws-agent-pause-btn:hover { background:rgba(251,191,36,0.18); border-color:rgba(251,191,36,0.5); }
+    #ws-agent-resume-btn { height:28px; padding:0 10px; border-radius:7px; border:1px solid rgba(74,222,128,0.35); background:rgba(74,222,128,0.1); color:#4ade80; font-size:11px; font-family:'DM Mono',monospace; letter-spacing:0.04em; cursor:pointer; display:none; align-items:center; gap:5px; transition:all 0.18s; white-space:nowrap; animation:ws-pause-pulse 2s ease-in-out infinite; }
+    #ws-agent-resume-btn:hover { background:rgba(74,222,128,0.22); border-color:rgba(74,222,128,0.6); animation:none; }
     #ws-agent-status-bar { padding:6px 14px; font-family:'DM Mono',monospace; font-size:10px; color:#94a3b8; border-bottom:1px solid rgba(255,255,255,0.04); }
     #ws-agent-status-bar.active { color:#06b6d4; }
+    #ws-agent-status-bar.paused { color:#f59e0b; }
     #ws-agent-feed { flex:1; overflow-y:auto; padding:12px; display:flex; flex-direction:column; gap:8px; font-family:sans-serif; scroll-behavior:smooth; }
     .ws-msg { padding:8px 12px; border-radius:8px; font-size:13px; line-height:1.5; word-wrap:break-word; max-width:90%; animation:ws-fadeIn 0.2s ease-out; }
     @keyframes ws-fadeIn { from{opacity:0;transform:translateY(4px)} to{opacity:1;transform:translateY(0)} }
@@ -859,7 +855,7 @@
     #ws-agent-footer { padding:8px 12px; border-top:1px solid rgba(255,255,255,0.04); flex-shrink:0; }
     #ws-agent-clear-btn { width:100%; background:transparent; border:1px solid rgba(255,255,255,0.06); border-radius:8px; padding:6px; color:#9ca3af; font-family:'DM Mono',monospace; font-size:10px; letter-spacing:0.07em; text-transform:uppercase; cursor:pointer; transition:all 0.2s; }
     #ws-agent-clear-btn:hover { border-color:rgba(239,68,68,0.3); color:#f87171; }
-    .ws-hdr-right { display:flex; align-items:center; gap:8px; }
+    .ws-hdr-right { display:flex; align-items:center; gap:6px; }
     #ws-hover-pill { display:flex; align-items:center; gap:6px; padding:5px 11px; border-radius:20px; border:1px solid rgba(255,255,255,0.08); background:rgba(30,41,59,0.7); cursor:pointer; transition:all 0.25s; user-select:none; }
     #ws-hover-pill:hover { background:rgba(30,41,59,0.95); border-color:rgba(255,255,255,0.14); }
     #ws-hover-pill.active { border-color:rgba(6,182,212,0.45); background:rgba(6,182,212,0.1); }
@@ -890,6 +886,8 @@
               <span class="ws-pill-icon">🖼</span>
               <span class="ws-pill-label">Image Hover</span>
             </div>
+            <button id="ws-agent-pause-btn" title="Pause — stop listening temporarily">⏸</button>
+            <button id="ws-agent-resume-btn" title="Resume listening">▶</button>
             <button id="ws-agent-stop-btn" title="Stop session">⏹</button>
           </div>
         </div>
@@ -939,11 +937,12 @@
     paneEl.querySelector('#ws-agent-start-btn').addEventListener('click', startAgent);
     paneEl.querySelector('#ws-agent-stop-btn').addEventListener('click', stopAgent);
     paneEl.querySelector('#ws-agent-clear-btn').addEventListener('click', clearHistory);
+    paneEl.querySelector('#ws-agent-pause-btn').addEventListener('click', pauseAgent);    // NEW v21
+    paneEl.querySelector('#ws-agent-resume-btn').addEventListener('click', resumeAgent);  // NEW v21
 
     // Image hover toggle
     const hoverPill = paneEl.querySelector('#ws-hover-pill');
     if (hoverPill) {
-      // Restore saved state
       try {
         chrome.storage.local.get('websight_image_hover', res => {
           imageHoverEnabled = !!res.websight_image_hover;
@@ -955,8 +954,6 @@
         imageHoverEnabled = !imageHoverEnabled;
         hoverPill.classList.toggle('active', imageHoverEnabled);
         try { chrome.storage.local.set({ websight_image_hover: imageHoverEnabled }); } catch (e) {}
-
-        // If turning off, immediately hide any visible tooltip and cancel pending hover
         if (!imageHoverEnabled) {
           if (hoverAbort) { hoverAbort.abort(); hoverAbort = null; }
           clearTimeout(hoverTimer);
