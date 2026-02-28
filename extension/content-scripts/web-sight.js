@@ -49,6 +49,7 @@
   let apiKey = null;
   let hoverTimer = null, lastHoverEl = null;
   let isSpeaking = false;
+  let imageHoverEnabled = false;
 
   // Abort controllers for cancellable operations
   let ttsAbort = null;       // Current TTS fetch
@@ -461,7 +462,7 @@
   }
 
   function onHover(e) {
-    if (!paneReady || !isActive) return;
+    if (!paneReady || !isActive || !imageHoverEnabled) return;
     const target = e.target;
     if (target.closest('#accessai-sidebar')) return;
 
@@ -853,6 +854,15 @@
     #ws-agent-footer { padding:8px 12px; border-top:1px solid rgba(255,255,255,0.04); flex-shrink:0; }
     #ws-agent-clear-btn { width:100%; background:transparent; border:1px solid rgba(255,255,255,0.06); border-radius:8px; padding:6px; color:#9ca3af; font-family:'DM Mono',monospace; font-size:10px; letter-spacing:0.07em; text-transform:uppercase; cursor:pointer; transition:all 0.2s; }
     #ws-agent-clear-btn:hover { border-color:rgba(239,68,68,0.3); color:#f87171; }
+    .ws-hdr-right { display:flex; align-items:center; gap:8px; }
+    #ws-hover-pill { display:flex; align-items:center; gap:6px; padding:5px 11px; border-radius:20px; border:1px solid rgba(255,255,255,0.08); background:rgba(30,41,59,0.7); cursor:pointer; transition:all 0.25s; user-select:none; }
+    #ws-hover-pill:hover { background:rgba(30,41,59,0.95); border-color:rgba(255,255,255,0.14); }
+    #ws-hover-pill.active { border-color:rgba(6,182,212,0.45); background:rgba(6,182,212,0.1); }
+    #ws-hover-pill .ws-pill-dot { width:7px; height:7px; border-radius:50%; background:#475569; transition:all 0.25s; flex-shrink:0; }
+    #ws-hover-pill.active .ws-pill-dot { background:#06b6d4; box-shadow:0 0 6px rgba(6,182,212,0.6); }
+    #ws-hover-pill .ws-pill-icon { font-size:12px; line-height:1; }
+    #ws-hover-pill .ws-pill-label { font-family:'DM Mono',monospace; font-size:10px; color:#94a3b8; letter-spacing:0.03em; transition:color 0.25s; white-space:nowrap; }
+    #ws-hover-pill.active .ws-pill-label { color:#7dd3fc; }
   `;
 
   const HTML = `
@@ -869,7 +879,14 @@
             <div id="ws-agent-live-dot"></div>
             <div class="ws-title">Web-Sight</div>
           </div>
-          <button id="ws-agent-stop-btn" title="Stop session">⏹</button>
+          <div class="ws-hdr-right">
+            <div id="ws-hover-pill" title="Toggle image hover descriptions">
+              <div class="ws-pill-dot"></div>
+              <span class="ws-pill-icon">🖼</span>
+              <span class="ws-pill-label">Image Hover</span>
+            </div>
+            <button id="ws-agent-stop-btn" title="Stop session">⏹</button>
+          </div>
         </div>
         <div id="ws-agent-status-bar">Connecting…</div>
         <div id="ws-agent-feed"></div>
@@ -917,6 +934,32 @@
     paneEl.querySelector('#ws-agent-start-btn').addEventListener('click', startAgent);
     paneEl.querySelector('#ws-agent-stop-btn').addEventListener('click', stopAgent);
     paneEl.querySelector('#ws-agent-clear-btn').addEventListener('click', clearHistory);
+
+    // Image hover toggle
+    const hoverPill = paneEl.querySelector('#ws-hover-pill');
+    if (hoverPill) {
+      // Restore saved state
+      try {
+        chrome.storage.local.get('websight_image_hover', res => {
+          imageHoverEnabled = !!res.websight_image_hover;
+          if (imageHoverEnabled) hoverPill.classList.add('active');
+        });
+      } catch (e) {}
+
+      hoverPill.addEventListener('click', () => {
+        imageHoverEnabled = !imageHoverEnabled;
+        hoverPill.classList.toggle('active', imageHoverEnabled);
+        try { chrome.storage.local.set({ websight_image_hover: imageHoverEnabled }); } catch (e) {}
+
+        // If turning off, immediately hide any visible tooltip and cancel pending hover
+        if (!imageHoverEnabled) {
+          if (hoverAbort) { hoverAbort.abort(); hoverAbort = null; }
+          clearTimeout(hoverTimer);
+          if (hoverOverlay) hoverOverlay.style.display = 'none';
+          lastHoverEl = null;
+        }
+      });
+    }
 
     if (!hoverOverlay) {
       hoverOverlay = document.createElement('div');
