@@ -130,6 +130,18 @@
     .sca-wordmark { display: flex; flex-direction: column; gap: 1px; }
     .sca-title { font-size: 11px; font-weight: 800; letter-spacing: 0.1em; text-transform: uppercase; color: #f0ecff; }
     .sca-sub { font-size: 9px; font-family: 'DM Mono', monospace; color: #4b5563; letter-spacing: 0.06em; }
+    .sc-hdr-right { display:flex; gap:6px; align-items: center; }
+    #sc-agent-pause-btn, #sc-agent-resume-btn { 
+        width:32px; height:32px; display:flex; align-items:center; justify-content:center; 
+        border-radius:8px; border:1px solid rgba(251,191,36,0.3); background:rgba(251,191,36,0.1); 
+        color:#fbbf24; cursor:pointer; font-size: 14px;
+    }
+    #sc-agent-resume-btn { border-color:rgba(74,222,128,0.3); background:rgba(74,222,128,0.1); color:#4ade80; display:none; }
+    #sc-agent-stop-btn { 
+        width:32px; height:32px; display:flex; align-items:center; justify-content:center;
+        border-radius:8px; border:1px solid rgba(239,68,68,0.3); 
+        background:rgba(239,68,68,0.1); color:#f87171; cursor:pointer; font-size: 14px;
+    }
     #sca-stop-btn {
       width: 26px; height: 26px; border-radius: 7px;
       border: 1px solid rgba(239,68,68,0.25); background: rgba(239,68,68,0.07); color: #f87171;
@@ -272,7 +284,11 @@
             <button id="sca-turn-btn" title="Toggle: alert me when it's my turn to speak">
               <span class="sca-turn-dot"></span>↩ My Turn
             </button>
-            <button id="sca-stop-btn" title="Stop session">⏹</button>
+            <div class="sc-hdr-right">
+            <button id="sc-agent-pause-btn" title="Pause">⏸</button>
+            <button id="sc-agent-resume-btn" title="Resume">▶</button>
+            <button id="sc-agent-stop-btn" title="Stop">⏹</button>
+          </div>
           </div>
         </div>
         <div id="sca-status-bar">Connecting…</div>
@@ -306,13 +322,15 @@
     pane.innerHTML = HTML;
 
     pane.querySelector('#sca-start-btn').addEventListener('click', startAll);
-    pane.querySelector('#sca-stop-btn').addEventListener('click', stopAll);
+    pane.querySelector('#sc-agent-stop-btn').addEventListener('click', stopAll);
     pane.querySelector('#sca-clear-btn').addEventListener('click', clearFeed);
     pane.querySelector('#sca-turn-btn').addEventListener('click', () => {
       turnMode = !turnMode;
       const btn = pane.querySelector('#sca-turn-btn');
       btn.classList.toggle('on', turnMode);
     });
+    pane.querySelector('#sc-agent-pause-btn').addEventListener('click', pauseAgent);
+    pane.querySelector('#sc-agent-resume-btn').addEventListener('click', resumeAgent);
   }
 
   // ─── UI helpers ───────────────────────────────────────────────────────────
@@ -419,6 +437,42 @@
     showIdle();
     setStatus('Stopped', '');
     window.__accessai?.setFooterStatus('Social Cue: stopped');
+  }
+  
+  let isPaused = false; // Add this to your "State" section at the top
+
+  function pauseAgent() {
+    if (!isListening || isPaused) return;
+    isPaused = true;
+    
+    // Stop the bars and dim the dot
+    $('sca-wave')?.classList.remove('active');
+    $('sca-live-dot')?.classList.remove('audio-active');
+    
+    setStatus('Paused', 'paused');
+    
+    // UI Swap
+    $('sc-agent-pause-btn').style.display = 'none';
+    $('sc-agent-resume-btn').style.display = 'flex';
+    
+    // Logic: In Social Cue, we just stop processing incoming chunks
+    addCard('[NOTE] ⏸ Analysis Paused', 'audio');
+  }
+
+  function resumeAgent() {
+    if (!isListening || !isPaused) return;
+    isPaused = false;
+    
+    $('sca-wave')?.classList.add('active');
+    $('sca-live-dot')?.classList.add('audio-active');
+    
+    setStatus('Listening...', 'active');
+    
+    // UI Swap
+    $('sc-agent-pause-btn').style.display = 'flex';
+    $('sc-agent-resume-btn').style.display = 'none';
+    
+    addCard('[NOTE] ▶ Analysis Resumed', 'audio');
   }
 
   function cleanup() {
@@ -658,7 +712,9 @@ Output NOTHING when conversation flows normally.`;
     // ── PCM16 encoder → WebSocket ──
     // FIX #40: Shared send function for both AudioWorklet and ScriptProcessor
     const sendAudioChunk = (f32) => {
-      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      // ADD THE isPaused CHECK HERE
+      if (!ws || ws.readyState !== WebSocket.OPEN || isPaused) return; 
+      
       const pcm = f32ToPCM16(f32);
       ws.send(JSON.stringify({
         type: 'input_audio_buffer.append',
@@ -723,13 +779,13 @@ Output NOTHING when conversation flows normally.`;
       if (isListening && visionEnabled) captureAndAnalyse();
       visionInterval = setInterval(() => {
         // FIX #10: Only start new capture if previous one finished
-        if (isListening && visionEnabled && !visionBusy) captureAndAnalyse();
+        if (isListening && visionEnabled && !visionBusy && !isPaused) captureAndAnalyse();
       }, VISION_INTERVAL);
     }, 3000);
   }
 
   async function captureAndAnalyse() {
-    if (visionBusy || !hiddenVideo || hiddenVideo.readyState < 2 || hiddenVideo.videoWidth === 0) return;
+    if (visionBusy || isPaused || !hiddenVideo || hiddenVideo.readyState < 2 || hiddenVideo.videoWidth === 0) return;
     visionBusy = true;
 
     const W = 1280;
