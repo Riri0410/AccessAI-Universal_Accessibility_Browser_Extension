@@ -31,7 +31,7 @@
   if (window.__websight_v20) return;
   window.__websight_v20 = true;
 
-  const SYSTEM_PROMPT = `You are a helpful web assistant. Use the available tools to help the user. When asked about anything visual, always call capture_screen first. Keep all responses short — 1 to 3 sentences max. No long paragraphs. Use markdown: **bold**, bullet points with -, and \`code\` where helpful.`;
+  const SYSTEM_PROMPT = `You are a helpful web assistant. Use the available tools to help the user. When asked about anything visual, always call capture_screen first. Keep all responses short — 1 to 3 sentences max. No long paragraphs. Use markdown: **bold**, bullet points with -, and \`code\` where helpful. When answering visual questions, always give a direct yes or no answer based on what you see — never say "I can't confirm" or "I'm not sure". If something is visible, say it is. If it's not visible, say it isn't.`;
 
   const HISTORY_KEY = 'websight_conversation_history';
   const MAX_HISTORY = 30;
@@ -50,6 +50,7 @@
   let hoverTimer = null, lastHoverEl = null;
   let isSpeaking = false;
   let imageHoverEnabled = false;
+  let currentCommand = '';   // The active user command — used to focus capture_screen vision
 
   // Abort controllers for cancellable operations
   let ttsAbort = null;       // Current TTS fetch
@@ -119,6 +120,7 @@
 
     isRunning = true;
     cancelTask = false;
+    currentCommand = command;
     taskAbort = new AbortController();
     setStatus('Thinking…', 'active');
     setDot('thinking');
@@ -199,12 +201,15 @@
         }
 
         const dataUrl = captureFrame();
+        const visionPrompt = currentCommand
+          ? `The user asked: "${currentCommand}". Look at this screen and answer their question directly. Be specific — identify exactly what they're asking about if it's visible. Also briefly describe any other relevant context on screen. 3-4 sentences max.`
+          : "Describe what's on this screen in 2-3 short sentences. Mention key text, diagram elements, or code. Be brief and clear.";
         const vResp = await ipc({
           type: 'API_REQUEST', model: 'gpt-4o',
           messages: [{
             role: 'user', content: [
               { type: 'image_url', image_url: { url: dataUrl, detail: 'high' } },
-              { type: 'text', text: "Describe what's on this screen in 2-3 short sentences. Mention key text, diagram elements, or code. Be brief and clear." },
+              { type: 'text', text: visionPrompt },
             ],
           }],
         });
