@@ -190,7 +190,7 @@
     pushGenericLayout(true);
 
     chrome.storage.local.set({ sidebarOpen: true });
-    chrome.storage.local.get('activeMode', (r) => { if (r.activeMode) selectMode(r.activeMode); });
+    chrome.storage.local.get('activeMode', (r) => { selectMode(r.activeMode || 'social-cue'); });
   }
 
   function closeSidebar() {
