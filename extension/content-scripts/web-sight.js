@@ -647,7 +647,7 @@
           type: 'session.update',
           session: {
             modalities: ['text', 'audio'],
-            input_audio_transcription: { model: 'whisper-1', language: 'en' },
+            input_audio_transcription: { model: 'gpt-4o-mini-transcribe'},
             turn_detection: {
               type: 'server_vad',
               threshold: 0.5,              // Lower = catches softer speech (was 0.7)
