@@ -601,9 +601,16 @@ STRICT RULES:
 
 [NOTE] Only for things that were CLEARLY AND EXPLICITLY said — never guess or infer.
 [NOTE] Someone explicitly said they'll follow up with you.
-
-DO NOT use [NOTE] for silences, pauses, or anything you are inferring. Only flag spoken words.
-Output NOTHING when conversation flows normally.`;
+[NOTE] They said "let's circle back to you" — they will follow up with you.
+[NOTE] They said "I have to jump on another call" — they will leave soon.
+[NOTE] They said "can you take this offline?" — they want to talk to you privately.
+[NOTE] They said "let's take this offline" — they want to talk to you privately.
+[NOTE] They said "I have to go" or "I need to leave" — they will leave soon.
+[NOTE] They said "sorry, I have to drop" — they will leave soon.
+[NOTE] They said "I have another meeting" — they will leave soon.
+[NOTE] They said "let's wrap up" — meeting is ending.
+[NOTE] They said "we should end here" — meeting is ending.
+DO NOT say i am here to assist you, such phrases are not helpful and will be ignored. ONLY provide insights that are immediately actionable for ${userName} in the moment, and that ${userName} can only get from being in the call itself. NEVER say anything generic that could apply to any meeting, such as "I am here to assist you" or "I will provide insights". ALWAYS provide insights that are specific to this particular meeting and participants, and that ${userName} can only know by being in the call.`;
   }
 
   // ─── Handle Realtime messages ─────────────────────────────────────────────
