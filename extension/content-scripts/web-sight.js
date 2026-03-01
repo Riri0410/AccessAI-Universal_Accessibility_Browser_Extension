@@ -29,6 +29,8 @@
 //   ✅ FIX: prefix_padding 300→500ms
 //   ✅ FIX: AudioWorklet replaces ScriptProcessor
 //   ✅ FIX: ScriptProcessor buffer 2048→4096 in fallback
+//   ✅ FIX: isHovering flag — mic muted during image hover, TTS still speaks
+//   ✅ FIX: Form fill prompt — GPT now fills ALL fields in one response
 // ============================================================
 
 (function () {
@@ -37,11 +39,12 @@
   if (window.__websight_v21) return;
   window.__websight_v21 = true;
 
-  const SYSTEM_PROMPT = `You are a helpful web assistant. Use the available tools to help the user. When asked about anything visual, always call capture_screen first. When the user asks "where is X" or "find X" or "show me X". Keep all responses short — 1 to 3 sentences max. No long paragraphs. Use markdown: **bold**, bullet points with -, and \`code\` where helpful.`;
+  const SYSTEM_PROMPT = `You are a helpful web assistant. Use the available tools to help the user. When asked about anything visual, always call capture_screen first. When the user asks "where is X" or "find X" or "show me X". Keep all responses short — 1 to 3 sentences max. No long paragraphs. Use markdown: **bold**, bullet points with -, and \`code\` where helpful.
+  When filling multiple form fields, you MUST execute ALL necessary type_text tool calls in a SINGLE response — do NOT stop after 2 or 3 fields. Fill every single field the user mentioned before giving a text reply.`;
 
   const HISTORY_KEY = 'websight_conversation_history';
   const MAX_HISTORY = 30;
-  const MAX_STEPS = 14;
+  const MAX_STEPS = 30;
   const TTS_MODEL = 'tts-1';
   const TTS_VOICE = 'nova';
   const TTS_SPEED = 1.1;
@@ -56,7 +59,8 @@
   let hoverTimer = null, lastHoverEl = null;
   let isSpeaking = false;
   let imageHoverEnabled = false;
-  let isPaused = false;  // NEW v21
+  let isPaused = false;
+  let isHovering = false;  // NEW: mic muted during image hover, TTS still speaks
 
   // Abort controllers
   let ttsAbort = null;
@@ -115,7 +119,7 @@
   async function runTask(command) {
     if (isFiller(command)) return;
     if (!isActive) return;
-    if (isPaused) return;  // NEW v21 — ignore commands while paused
+    if (isPaused) return;
 
     if (isRunning) {
       cancelTask = true;
@@ -141,7 +145,7 @@
     let steps = 0, reply = '';
     try {
       while (steps < MAX_STEPS) {
-        if (cancelTask || !isActive || isPaused) break;  // NEW v21 — stop on pause
+        if (cancelTask || !isActive || isPaused) break;
         steps++;
 
         const resp = await ipc({ type: 'API_REQUEST', model: 'gpt-4o', messages, tools: TOOLS, tool_choice: 'auto' });
@@ -283,7 +287,6 @@
         return { success: true, description: resp?.data?.choices?.[0]?.message?.content || 'Unable to describe.' };
       }
 
-      
       default:
         return { success: false, error: `Unknown tool: ${name}` };
     }
@@ -313,8 +316,9 @@
       .trim();
   }
 
-  async function speak(text) {
-    if (!text || !apiKey || !isActive || isPaused) return;  // NEW v21 — no speak when paused
+  async function speak(text, onDone) {
+    // NOTE: isHovering is intentionally NOT checked here — TTS should still fire during hover
+    if (!text || !apiKey || !isActive || isPaused) return;
 
     stopSpeech();
 
@@ -350,8 +354,8 @@
       _ttsBlobUrl = URL.createObjectURL(blob);
       _ttsAudio = new Audio(_ttsBlobUrl);
 
-      _ttsAudio.onended = () => { cleanupAudio(); isSpeaking = false; };
-      _ttsAudio.onerror = () => { cleanupAudio(); isSpeaking = false; };
+      _ttsAudio.onended = () => { cleanupAudio(); isSpeaking = false; onDone?.();};
+      _ttsAudio.onerror = () => { cleanupAudio(); isSpeaking = false; onDone?.();};
 
       if (signal.aborted || !isActive || isPaused) { cleanupAudio(); return; }
 
@@ -360,6 +364,7 @@
       if (e.name !== 'AbortError') console.warn('[WebSight] TTS error:', e.message);
       cleanupAudio();
       isSpeaking = false;
+      onDone?.();
     }
   }
 
@@ -381,21 +386,18 @@
     if (_ttsBlobUrl) { URL.revokeObjectURL(_ttsBlobUrl); _ttsBlobUrl = null; }
   }
 
-  // ─── Pause / Resume (NEW v21) ─────────────────────────────
+  // ─── Pause / Resume ───────────────────────────────────────
   function pauseAgent() {
     if (!isActive || isPaused) return;
     isPaused = true;
 
-    // Stop any current speech immediately
     stopSpeech();
 
-    // Cancel any in-progress task
     if (isRunning) {
       cancelTask = true;
       taskAbort?.abort();
     }
 
-    // Update UI
     setDot('paused');
     setStatus('Paused — tap Resume to continue', 'paused');
     window.__accessai?.setFooterStatus('Web-Sight: paused');
@@ -413,7 +415,6 @@
     isPaused = false;
     cancelTask = false;
 
-    // Update UI
     setDot('on');
     setStatus('Listening…', 'active');
     window.__accessai?.setFooterStatus('Web-Sight: active');
@@ -430,6 +431,8 @@
   async function describeImageHover(imgEl) {
     if (!apiKey || !isActive) return;
 
+    isHovering = true;  // NEW: mute mic input during hover analysis
+
     if (hoverAbort) { hoverAbort.abort(); hoverAbort = null; }
     hoverAbort = new AbortController();
 
@@ -439,11 +442,12 @@
     if (!src || src.length < 5) {
       if (altText) { showHoverTip(imgEl, altText); speak(altText); }
       else if (hoverOverlay) hoverOverlay.style.display = 'none';
+      isHovering = false;  // NEW: restore mic
       return;
     }
 
     if (!src.startsWith('http') && !src.startsWith('data:')) {
-      try { src = new URL(src, location.href).href; } catch (e) { return; }
+      try { src = new URL(src, location.href).href; } catch (e) { isHovering = false; return; }
     }
 
     let finalUrl = src;
@@ -462,26 +466,26 @@
 
     try {
       const resp = await ipc({
-        type: 'API_REQUEST', model: 'gpt-4o', max_tokens: 30,
+        type: 'API_REQUEST', model: 'gpt-4o', max_tokens: 100,
         messages: [{
           role: 'user', content: [
-            { type: 'text', text: 'Describe exactly what is happening in this image. Focus on subjects, actions, and clothing. Max 15 words.' },
+            { type: 'text', text: 'Describe exactly what is happening in this image. Focus on subjects, actions, and clothing. Max 50 words.' },
             { type: 'image_url', image_url: { url: finalUrl, detail: 'low' } },
           ],
         }],
       });
 
-      if (!isActive) return;
+      if (!isActive) { isHovering = false; return; }
 
       const desc = resp?.data?.choices?.[0]?.message?.content?.trim();
       if (!desc || /I can'?t see|I cannot see|sorry/i.test(desc)) throw new Error('Vision failed');
 
       showHoverTip(imgEl, desc);
-      speak(desc);
+      speak(desc, () => { isHovering = false; });
     } catch (e) {
-      if (!isActive) return;
-      if (altText) { showHoverTip(imgEl, altText); speak(altText); }
-      else { showHoverTip(imgEl, 'Image (Cannot analyze)'); }
+      if (!isActive) { isHovering = false; return; }
+      if (altText) { showHoverTip(imgEl, altText); speak(altText, () => { isHovering = false; }); }
+else { showHoverTip(imgEl, 'Image (Cannot analyze)'); isHovering = false; }
     }
   }
 
@@ -498,6 +502,7 @@
       lastHoverEl = imgEl;
       hoverTimer = setTimeout(() => describeImageHover(imgEl), 1500);
     } else {
+      isHovering = false;  // NEW: ensure mic re-enabled when mouse leaves image
       if (hoverAbort) { hoverAbort.abort(); hoverAbort = null; }
       if (hoverOverlay) hoverOverlay.style.display = 'none';
       lastHoverEl = null;
@@ -552,6 +557,7 @@
 
       isActive = true;
       isPaused = false;
+      isHovering = false;
       showActive();
 
       setStatus('Analyzing page…', 'active');
@@ -601,6 +607,7 @@
     isActive = false;
     isRunning = false;
     isPaused = false;
+    isHovering = false;  // NEW: reset on stop
     cancelTask = true;
 
     stopSpeech();
@@ -633,7 +640,6 @@
     if (hoverOverlay) hoverOverlay.style.display = 'none';
     lastHoverEl = null;
 
-    // Clear all pulse highlights
     document.querySelectorAll('[data-aai-pulse]').forEach(e => {
       e.style.outline = '';
       e.style.outlineOffset = '';
@@ -679,7 +685,8 @@
         const sendAudioChunk = (f32) => {
           if (!ws || ws.readyState !== WebSocket.OPEN) return;
           if (isSpeaking) return;
-          if (isPaused) return;  // NEW v21 — don't send audio when paused
+          if (isPaused) return;
+          if (imageHoverEnabled) return;  // NEW: block mic during image hover
 
           const i16 = new Int16Array(f32.length);
           for (let i = 0; i < f32.length; i++) {
@@ -741,7 +748,7 @@
         try { ev = JSON.parse(e.data); } catch (err) { return; }
 
         if (ev.type === 'conversation.item.input_audio_transcription.completed' && ev.transcript?.trim()) {
-          if (!isSpeaking && isActive && !isPaused) {  // NEW v21 — ignore transcripts when paused
+          if (!isSpeaking && isActive && !isPaused && !imageHoverEnabled) {  // NEW: ignore transcripts during image hover
             const transcript = ev.transcript.trim();
             addMsg('user', transcript);
             runTask(transcript);
@@ -780,7 +787,7 @@
   function pageContext() {
     const searchInput = document.querySelector('input[name="q"]')?.value || '';
     const forms = [...document.querySelectorAll('input:not([type="hidden"]), textarea, select')]
-      .slice(0, 15)
+      .slice(0, 50)  // increased from 15 to 30 for better form coverage
       .map(el => el.placeholder || el.name || el.id || el.getAttribute('aria-label') || 'input field');
     const formStr = forms.length > 0 ? `\nForms visible on page: ${forms.join(', ')}` : '';
     return `Domain: ${location.hostname}\nURL: ${location.href}\nTitle: ${document.title}\nActive Query: ${searchInput}${formStr}`;
@@ -840,7 +847,7 @@
     #ws-agent-stop-btn:hover { background:rgba(239,68,68,0.18); border-color:rgba(239,68,68,0.5); }
     #ws-agent-pause-btn { height:28px; padding:0 10px; border-radius:7px; border:1px solid rgba(251,191,36,0.25); background:rgba(251,191,36,0.07); color:#fbbf24; font-size:11px; font-family:'DM Mono',monospace; letter-spacing:0.04em; cursor:pointer; display:flex; align-items:center; gap:5px; transition:all 0.18s; white-space:nowrap; }
     #ws-agent-pause-btn:hover { background:rgba(251,191,36,0.18); border-color:rgba(251,191,36,0.5); }
-    #ws-agent-resume-btn { height:28px; padding:0 10px; border-radius:7px; border:1px solid rgba(74,222,128,0.35); background:rgba(74,222,128,0.1); color:#4ade80; font-size:11px; font-family:'DM Mono',monospace; letter-spacing:0.04em; cursor:pointer; display:none; align-items:center; gap:5px; transition:all 0.18s; white-space:nowrap; animation:ws-pause-pulse 2s ease-in-out infinite; }
+    #ws-agent-resume-btn { height:28px; padding:0 10px; border-radius:7px; border:1px solid rgba(74,222,128,0.35); background:rgba(74,222,128,0.1); color:#4ade80; font-size:11px; font-family:'DM Mono',monospace; letter-spacing:0.04em; cursor:pointer; display:none; align-items:center; gap:5px; transition:all 0.18s; animation:ws-pause-pulse 2s ease-in-out infinite; }
     #ws-agent-resume-btn:hover { background:rgba(74,222,128,0.22); border-color:rgba(74,222,128,0.6); animation:none; }
     #ws-agent-status-bar { padding:6px 14px; font-family:'DM Mono',monospace; font-size:10px; color:#94a3b8; border-bottom:1px solid rgba(255,255,255,0.04); }
     #ws-agent-status-bar.active { color:#06b6d4; }
@@ -937,8 +944,8 @@
     paneEl.querySelector('#ws-agent-start-btn').addEventListener('click', startAgent);
     paneEl.querySelector('#ws-agent-stop-btn').addEventListener('click', stopAgent);
     paneEl.querySelector('#ws-agent-clear-btn').addEventListener('click', clearHistory);
-    paneEl.querySelector('#ws-agent-pause-btn').addEventListener('click', pauseAgent);    // NEW v21
-    paneEl.querySelector('#ws-agent-resume-btn').addEventListener('click', resumeAgent);  // NEW v21
+    paneEl.querySelector('#ws-agent-pause-btn').addEventListener('click', pauseAgent);
+    paneEl.querySelector('#ws-agent-resume-btn').addEventListener('click', resumeAgent);
 
     // Image hover toggle
     const hoverPill = paneEl.querySelector('#ws-hover-pill');
@@ -955,6 +962,7 @@
         hoverPill.classList.toggle('active', imageHoverEnabled);
         try { chrome.storage.local.set({ websight_image_hover: imageHoverEnabled }); } catch (e) {}
         if (!imageHoverEnabled) {
+          isHovering = false;  // NEW: reset on toggle off
           if (hoverAbort) { hoverAbort.abort(); hoverAbort = null; }
           clearTimeout(hoverTimer);
           if (hoverOverlay) hoverOverlay.style.display = 'none';
