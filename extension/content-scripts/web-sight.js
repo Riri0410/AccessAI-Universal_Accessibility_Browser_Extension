@@ -871,7 +871,7 @@
       <div id="ws-agent-idle">
         <div class="ws-orb">🌐</div>
         <div class="ws-idle-title">Web-Sight</div>
-        <div class="ws-idle-desc">Your voice-controlled web assistant. Ready to help you read and navigate pages.</div>
+        <div class="ws-idle-desc">Your AI-powered visual assistant. Ready to help you read, explore, and explain what's on your screen.</div>
         <button id="ws-agent-start-btn"><span style="font-size:17px">🎙</span> Start Session</button>
       </div>
       <div id="ws-agent-active">
