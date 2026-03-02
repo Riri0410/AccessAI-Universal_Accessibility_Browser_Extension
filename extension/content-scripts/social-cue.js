@@ -324,11 +324,22 @@
     pane.querySelector('#sca-start-btn').addEventListener('click', startAll);
     pane.querySelector('#sc-agent-stop-btn').addEventListener('click', stopAll);
     pane.querySelector('#sca-clear-btn').addEventListener('click', clearFeed);
-    pane.querySelector('#sca-turn-btn').addEventListener('click', () => {
-      turnMode = !turnMode;
-      const btn = pane.querySelector('#sca-turn-btn');
-      btn.classList.toggle('on', turnMode);
-    });
+      pane.querySelector('#sca-turn-btn').addEventListener('click', () => {
+  turnMode = !turnMode;
+  const btn = pane.querySelector('#sca-turn-btn');
+  btn.classList.toggle('on', turnMode);
+  
+  // ADD THIS: if turning on, fire the cue immediately after 2s pause
+  if (turnMode) {
+    setTimeout(() => {
+      if (turnMode) { // still enabled after 2s
+        addCard('[TURN] Natural pause — your turn to speak.', 'audio');
+        turnMode = false;
+        btn.classList.remove('on');
+      }
+    }, 5000);
+  }
+});
     pane.querySelector('#sc-agent-pause-btn').addEventListener('click', pauseAgent);
     pane.querySelector('#sc-agent-resume-btn').addEventListener('click', resumeAgent);
   }
