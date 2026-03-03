@@ -2,7 +2,7 @@
 // ClearContext v5 — Intelligent Topic Card Engine
 //
 // Architecture:
-//   1. Screen/tab audio only (no mic needed) → Whisper transcription
+//   1. Screen/tab audio only (no mic needed) → gpt-4o-mini-transcribe transcription
 //   2. Transcripts accumulate in a rolling buffer
 //   3. Every 3 chunks AI decides: skip / create new card / update existing
 //   4. Cards are markdown-rich, topic-aware, and persistently saved
@@ -16,7 +16,7 @@
   'use strict';
 
   // ─── Config ──────────────────────────────────────────────
-  const CHUNK_MS           = 8000;  // 8 s audio chunks sent to Whisper
+  const CHUNK_MS           = 8000;  // 8 s audio chunks sent to gpt-4o-mini-transcribe
   const ANALYSIS_EVERY_N   = 3;     // run AI card analysis after N new transcripts
   const MAX_TRANSCRIPT_BUF = 30;    // rolling transcript window for context
   const AI_MODEL           = 'gpt-4o';
@@ -53,6 +53,7 @@
   let cardsEl   = null;
   let chatEl    = null;
   let chatInput = null;
+  let chatHistory = [];   // In-memory conversation turns for multi-turn chat context
 
   // ─── Storage helpers ─────────────────────────────────────
   function storageKey() { return 'cc_ws_' + (workspace || 'default'); }
@@ -613,6 +614,7 @@
       // If recording, only change the DISPLAY — don't stop recording
       const displayCards = await loadCardsForWorkspace(sel);
       viewWorkspace = sel;
+      chatHistory = [];   // Reset chat context when switching workspace
       cardsEl.querySelectorAll('.acc-card-wrap').forEach(el => el.remove());
       const emptyEl = document.getElementById('acc-cards-empty');
       if (displayCards.length === 0) {
@@ -653,6 +655,7 @@
     viewWorkspace = name;
     cards         = await loadCardsForWorkspace(name);
     cardIdCounter = cards.length > 0 ? Math.max(...cards.map(c => c.id)) + 1 : 0;
+    chatHistory   = [];   // Reset chat context for new workspace
 
     document.getElementById('acc-hero').style.display = 'none';
     document.getElementById('acc-main').style.display = 'flex';
@@ -894,8 +897,7 @@
       const ext = mimeType.includes('mp4') ? 'mp4' : mimeType.includes('ogg') ? 'ogg' : 'webm';
       const fd = new FormData();
       fd.append('file', blob, 'audio.' + ext);
-      fd.append('model', 'whisper-1');
-      fd.append('language', 'en');
+      fd.append('model', 'gpt-4o-mini-transcribe');
       fd.append('temperature', '0');
 
       const wr = await fetch('https://api.openai.com/v1/audio/transcriptions', {
@@ -905,7 +907,7 @@
       });
       if (!wr.ok) {
         const e = await wr.json().catch(() => ({}));
-        throw new Error(e.error?.message || 'Whisper ' + wr.status);
+        throw new Error(e.error?.message || 'Transcription error ' + wr.status);
       }
       const wData      = await wr.json();
       const transcript = (wData.text || '').trim();
@@ -946,7 +948,7 @@
 Your job is to build a rich set of knowledge cards — one card per DISTINCT topic, concept, piece of code, or example shown.
 
 You receive:
-1. Rolling audio transcript — may have Whisper mishearings (wrong brand names, tech terms, product names)
+1. Rolling audio transcript — may have transcription mishearings (wrong brand names, tech terms, product names)
 2. A screenshot of the current screen — USE THIS as the ground truth.
    - Correct any mishearings: if screen shows "CrewAI" but transcript says "CREO AI", use "CrewAI"
    - If you see CODE on screen, extract it exactly and put it in a code card
@@ -1294,6 +1296,7 @@ RULES:
           model: AI_MODEL,
           messages: [
             { role: 'system', content: systemMsg },
+            ...chatHistory,
             { role: 'user', content: q },
           ],
           max_tokens: 400,
@@ -1304,6 +1307,11 @@ RULES:
       const data   = await resp.json();
       const answer = (data.choices?.[0]?.message?.content || '').trim() || 'No answer found.';
       thinkEl.innerHTML = '<div class="acc-chat-lbl">ClearContext</div><div>' + renderMarkdown(answer) + '</div>';
+
+      // Save this turn to history (keep last 20 turns to avoid token overflow)
+      chatHistory.push({ role: 'user', content: q });
+      chatHistory.push({ role: 'assistant', content: answer });
+      if (chatHistory.length > 40) chatHistory.splice(0, 2);
     } catch (e) {
       thinkEl.innerHTML = '<div class="acc-chat-lbl">ClearContext</div><div>❌ ' + escHtml(e.message) + '</div>';
     }

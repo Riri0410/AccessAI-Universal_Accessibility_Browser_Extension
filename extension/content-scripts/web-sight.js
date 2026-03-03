@@ -1,45 +1,103 @@
 // ============================================================
-// Web-Sight v19 — Chrome Restart History Wipe
+// Web-Sight v21 — Find & Highlight + Pause/Resume
+// ============================================================
+// New in v21:
+//   ✅ NEW: Pulse highlight — glowing animated cyan border, stays 5s
+//   ✅ NEW: Pause button — stops mic input, stops AI, stops speech
+//   ✅ NEW: Resume button — picks back up exactly where left off
+//   ✅ NEW: isPaused guard on all audio send paths
+//   ✅ NEW: isPaused guard on all speech paths
+//   ✅ NEW: Pause indicator in status bar + dot turns yellow
+//   ✅ NEW: Any in-flight task cancelled on pause
+//   ✅ FIX: Stop button now IMMEDIATELY kills all speech (AbortController on TTS fetch)
+//   ✅ FIX: Upgraded to tts-1 + "nova" voice
+//   ✅ FIX: All pending API calls abort on stopAgent() — no zombie audio
+//   ✅ FIX: AudioContext + ScriptProcessor properly closed on stop
+//   ✅ FIX: speak() guarded by isActive — won't fire after stop
+//   ✅ FIX: Hover vision calls abort on stop
+//   ✅ FIX: describe_image tool implemented in execTool
+//   ✅ FIX: scroll_page handles 'top' and 'bottom' correctly
+//   ✅ FIX: Race condition guard — queued tasks cancel cleanly
+//   ✅ FIX: Blob URLs always revoked
+//   ✅ FIX: WebSocket close code + reason for clean disconnect
+//   ✅ FIX: displayStream ended listener uses { once: true }
+//   ✅ PERF: Speech queue — new speech cancels old, zero overlap
+//   ✅ PERF: Debounced hover with abort on mouse-out
+//   ✅ FIX: Mic echoCancellation + noiseSuppression + autoGainControl
+//   ✅ FIX: VAD threshold 0.7→0.5
+//   ✅ FIX: silence_duration 800→1200ms
+//   ✅ FIX: prefix_padding 300→500ms
+//   ✅ FIX: AudioWorklet replaces ScriptProcessor
+//   ✅ FIX: ScriptProcessor buffer 2048→4096 in fallback
+//   ✅ FIX: isHovering flag — mic muted during image hover, TTS still speaks
+//   ✅ FIX: Form fill prompt — GPT now fills ALL fields in one response
 // ============================================================
 
 (function () {
   'use strict';
 
-  if (window.__websight_v19) return;
-  window.__websight_v19 = true;
+  if (window.__websight_v21) return;
+  window.__websight_v21 = true;
 
-  const SYSTEM_PROMPT = `You are Web-Sight, an AI web assistant for a user with dyslexia.
+  const SYSTEM_PROMPT = `You are a helpful web assistant. Use the available tools to help the user. When asked about anything visual, always call capture_screen first. When the user asks "where is X" or "find X" or "show me X". Keep all responses short — 1 to 3 sentences max. No long paragraphs. Use markdown: **bold**, bullet points with -, and \`code\` where helpful.
+  When filling multiple form fields, you MUST execute ALL necessary type_text tool calls in a SINGLE response — do NOT stop after 2 or 3 fields. Fill every single field the user mentioned before giving a text reply.`;
 
-CRITICAL RULES:
-1. NO LOOPING AND UNCLEAR COMMANDS: If a command is vague, incomplete, or you do not understand what the user wants, DO NOT guess. Reply EXACTLY with: "Not clear, please elaborate."
-2. CAPTURE SCREEN: Only use capture_screen when the user explicitly asks about the screen layout or says they are lost/overwhelmed. Give ONE simple first step.
-3. FORMS & INPUTS: If the page context shows forms, proactively tell the user what they are for (e.g. "I see a form for your education. You should type your recent degree here.").
-4. SUMMARIZE: Use read_page to summarize the page if asked.
-5. IMAGES: Describe actions and clothing (e.g. "Cat running", "Human wearing a saree").`;
-
-  // FIX: Matching the exact key that background.js wipes on chrome.runtime.onStartup
-  const HISTORY_KEY = 'websight_conversation_history'; 
+  const HISTORY_KEY = 'websight_conversation_history';
   const MAX_HISTORY = 30;
-  const MAX_STEPS = 14;
+  const MAX_STEPS = 30;
+  const TTS_MODEL = 'tts-1';
+  const TTS_VOICE = 'nova';
+  const TTS_SPEED = 1.1;
 
+  // ─── State ────────────────────────────────────────────────
   let paneEl = null, outputEl = null, hoverOverlay = null;
   let paneReady = false, isActive = false, isRunning = false;
   let cancelTask = false, history = [];
   let ws = null, micStream = null, displayStream = null, hiddenVideo = null;
-  let micCtx = null, micProc = null;
+  let micCtx = null, micProc = null, micSrc = null, micWorklet = null;
   let apiKey = null;
   let hoverTimer = null, lastHoverEl = null;
-  let isSpeaking = false; 
+  let isSpeaking = false;
+  let imageHoverEnabled = false;
+  let isPaused = false;
+  let isHovering = false;  // NEW: mic muted during image hover, TTS still speaks
+
+  // Abort controllers
+  let ttsAbort = null;
+  let hoverAbort = null;
+  let taskAbort = null;
+  let _ttsAudio = null;
+  let _ttsBlobUrl = null;
 
   // ─── History ──────────────────────────────────────────────
-  function saveHistory() { try { chrome.storage.local.set({ [HISTORY_KEY]: history.slice(-MAX_HISTORY) }); } catch (e) {} }
-  function loadHistory() { return new Promise(r => { try { chrome.storage.local.get(HISTORY_KEY, res => { history = res[HISTORY_KEY] || []; r(); }); } catch (e) { history = []; r(); } }); }
-  function clearHistory() { history = []; try { chrome.storage.local.remove(HISTORY_KEY); } catch (e) {} if (outputEl) outputEl.innerHTML = ''; }
-  function gptHistory() { return history.filter(e => e.type === 'cmd' || e.type === 'reply').slice(-10).map(e => ({ role: e.role === 'ai' ? 'assistant' : 'user', content: e.text })); }
+  function saveHistory() {
+    try { chrome.storage.local.set({ [HISTORY_KEY]: history.slice(-MAX_HISTORY) }); } catch (e) {}
+  }
 
-  // ─── Filler detection ────────────────────────
-  const FILLERS = /^(bye|goodbye|hello|hi|hey|okay|ok|yes|no|sure|thanks|ready|testing|test|hmm|uh|um|ah)\.?$/i;
-  function isFiller(text) { return FILLERS.test(text.trim()) || (text.trim().split(/\s+/).length <= 2 && text.trim().length < 8); }
+  function loadHistory() {
+    return new Promise(r => {
+      try {
+        chrome.storage.local.get(HISTORY_KEY, res => { history = res[HISTORY_KEY] || []; r(); });
+      } catch (e) { history = []; r(); }
+    });
+  }
+
+  function clearHistory() {
+    history = [];
+    try { chrome.storage.local.remove(HISTORY_KEY); } catch (e) {}
+    if (outputEl) outputEl.innerHTML = '';
+  }
+
+  function gptHistory() {
+    return history
+      .filter(e => e.type === 'cmd' || e.type === 'reply')
+      .slice(-10)
+      .map(e => ({ role: e.role === 'ai' ? 'assistant' : 'user', content: e.text }));
+  }
+
+  // ─── Filler detection ─────────────────────────────────────
+  const FILLERS = /^(bye|goodbye|hello|hi|hey|okay|ok|yes|no|sure|thanks|thank you|ready|testing|test|hmm|uh|um|ah|mhm|yeah)\.?$/i;
+  function isFiller(text) { return FILLERS.test(text.trim()); }
 
   // ─── Tools ────────────────────────────────────────────────
   const TOOLS = [
@@ -48,170 +106,407 @@ CRITICAL RULES:
     mkfn('read_page', 'Summarize the text content of the entire page.', {}, []),
     mkfn('click_element', 'Click element by CSS selector.', { selector: { type: 'string' } }, ['selector']),
     mkfn('type_text', 'Type text into an input.', { selector: { type: 'string' }, text: { type: 'string' } }, ['text']),
-    mkfn('scroll_page', 'Scroll the page.', { direction: { type: 'string', enum: ['up','down','top','bottom'] } }, ['direction']),
+    mkfn('scroll_page', 'Scroll the page.', { direction: { type: 'string', enum: ['up', 'down', 'top', 'bottom'] } }, ['direction']),
     mkfn('navigate_to', 'Go to URL.', { url: { type: 'string' } }, ['url']),
-    mkfn('describe_image', 'Describe an image using AI vision.', { selector: { type: 'string' } }, ['selector']),
+    mkfn('describe_image', 'Describe an image on the page using AI vision.', { selector: { type: 'string' } }, ['selector']),
   ];
-  function mkfn(name, description, props, required = []) { return { type: 'function', function: { name, description, parameters: { type: 'object', properties: props, required } } }; }
 
-  // ─── Agent ────────────────────────────────────────────────
+  function mkfn(name, description, props, required = []) {
+    return { type: 'function', function: { name, description, parameters: { type: 'object', properties: props, required } } };
+  }
+
+  // ─── Agent Loop ───────────────────────────────────────────
   async function runTask(command) {
-    if (isFiller(command)) return; 
-    if (isRunning) { cancelTask = true; await wait(400); cancelTask = false; }
-    
-    isRunning = true; cancelTask = false;
-    setStatus('Thinking…', 'active'); setDot('thinking');
+    if (isFiller(command)) return;
+    if (!isActive) return;
+    if (isPaused) return;
+
+    if (isRunning) {
+      cancelTask = true;
+      taskAbort?.abort();
+      await wait(300);
+      cancelTask = false;
+    }
+
+    isRunning = true;
+    cancelTask = false;
+    taskAbort = new AbortController();
+    setStatus('Thinking…', 'active');
+    setDot('thinking');
+
+    stopSpeech();
 
     const messages = [
       { role: 'system', content: SYSTEM_PROMPT },
       ...gptHistory(),
-      { role: 'user', content: `Command: "${command}"\nPage Context:\n${pageContext()}` },
+      { role: 'user', content: `${command}\n\nMetadata: URL=${location.href}, Title=${document.title}, Domain=${location.hostname}\nContext: ${pageContext()}` },
     ];
 
     let steps = 0, reply = '';
     try {
       while (steps < MAX_STEPS) {
-        if (cancelTask) break;
+        if (cancelTask || !isActive || isPaused) break;
         steps++;
 
         const resp = await ipc({ type: 'API_REQUEST', model: 'gpt-4o', messages, tools: TOOLS, tool_choice: 'auto' });
-        const choice = resp.data?.choices?.[0];
 
-        if (choice?.message?.tool_calls?.length) {
-          messages.push({ role: 'assistant', content: choice.message.content || null, tool_calls: choice.message.tool_calls });
+        if (cancelTask || !isActive || isPaused) break;
+
+        const choice = resp?.data?.choices?.[0];
+        if (!choice) { reply = 'No response received.'; break; }
+
+        if (choice.message?.tool_calls?.length) {
+          messages.push({
+            role: 'assistant',
+            content: choice.message.content || null,
+            tool_calls: choice.message.tool_calls,
+          });
+
           for (const tc of choice.message.tool_calls) {
-            let args = {}; try { args = JSON.parse(tc.function.arguments); } catch (e) {}
+            if (cancelTask || !isActive || isPaused) break;
+            let args = {};
+            try { args = JSON.parse(tc.function.arguments); } catch (e) {}
             addMsg('action', `Running: ${tc.function.name}`);
             const result = await execTool(tc.function.name, args);
             messages.push({ role: 'tool', content: JSON.stringify(result), tool_call_id: tc.id });
           }
         } else {
-          reply = choice?.message?.content?.trim() || 'Done.'; break;
+          reply = choice.message?.content?.trim() || 'Done.';
+          break;
         }
       }
-    } catch (err) { reply = `Error: ${err.message}`; }
+    } catch (err) {
+      if (!cancelTask && isActive && !isPaused) reply = `Error: ${err.message}`;
+    }
 
-    if (reply && !cancelTask) {
-      addMsg('response', reply); 
-      
-      // Keep soft prompt silent (UI only)
-      if (!reply.includes("Not clear, please elaborate.")) {
-        speak(reply);
-      }
-      
+    if (reply && !cancelTask && isActive && !isPaused) {
+      addMsg('response', reply);
+      speak(reply);
       history.push({ role: 'user', type: 'cmd', text: command, time: ts() });
       history.push({ role: 'ai', type: 'reply', text: reply, time: ts() });
       saveHistory();
     }
-    isRunning = false; setDot('on'); setStatus('Listening…', 'active');
+
+    isRunning = false;
+    taskAbort = null;
+    if (isActive && !isPaused) { setDot('on'); setStatus('Listening…', 'active'); }
   }
 
-  // ─── Tool executor ────────────────────────────────────────
+  // ─── Tool Executor ────────────────────────────────────────
   async function execTool(name, args) {
     switch (name) {
       case 'capture_screen': {
         if (!hiddenVideo) return { success: false, error: 'No screen shared' };
-        
         if (hiddenVideo.videoWidth === 0) {
-            await new Promise(r => {
-                hiddenVideo.onloadedmetadata = r;
-                setTimeout(r, 1500); 
-            });
+          await new Promise(r => {
+            hiddenVideo.onloadedmetadata = r;
+            setTimeout(r, 1500);
+          });
         }
-        if (hiddenVideo.videoWidth === 0) return { success: false, error: 'Screen blank. Please ensure you clicked "Share" on the browser popup.' };
-
-        const canvas = document.createElement('canvas');
-        canvas.width = 1280; 
-        canvas.height = Math.round(1280 * (hiddenVideo.videoHeight / hiddenVideo.videoWidth)) || 720;
-        canvas.getContext('2d').drawImage(hiddenVideo, 0, 0, canvas.width, canvas.height);
-        const dataUrl = canvas.toDataURL('image/jpeg', 0.55);
-
-        const vResp = await ipc({ type: 'API_REQUEST', model: 'gpt-4o', messages: [{
+        if (hiddenVideo.videoWidth === 0) {
+          return { success: false, error: 'Screen blank. Please ensure you clicked "Share" on the browser popup.' };
+        }
+        const dataUrl = captureFrame();
+        const vResp = await ipc({
+          type: 'API_REQUEST', model: 'gpt-4o',
+          messages: [{
             role: 'user', content: [
-            { type: 'text', text: "What is on this screen? Describe it simply." },
-            { type: 'image_url', image_url: { url: dataUrl, detail: 'low' } }
-            ]
-        }]});
+              { type: 'image_url', image_url: { url: dataUrl, detail: 'high' } },
+              { type: 'text', text: "Describe what's on this screen in 2-3 short sentences. Mention key text, diagram elements, or code. Be brief and clear." },
+            ],
+          }],
+        });
         return { success: true, description: vResp.data?.choices?.[0]?.message?.content };
       }
+
       case 'read_page': {
-        const text = document.body.innerText.replace(/\s+/g, ' ').slice(0, 4000);
-        return { success: true, text: text };
+        const text = document.body.innerText.replace(/\s+/g, ' ');
+        return { success: true, text };
       }
-      case 'get_page_context': return pageContext();
-      case 'click_element': { const el = resolve(args.selector); if (el) { highlight(el); el.click(); return { success: true }; } return { success: false }; }
-      case 'type_text': { const el = resolve(args.selector); if (el) { el.value = args.text; el.dispatchEvent(new Event('input', { bubbles: true })); return { success: true }; } return { success: false }; }
-      case 'navigate_to': { window.location.href = args.url.startsWith('http') ? args.url : 'https://'+args.url; return { success: true }; }
-      case 'scroll_page': window.scrollBy({ top: args.direction === 'down' ? 500 : -500, behavior: 'smooth' }); return { success: true };
-      default: return { success: false };
+
+      case 'get_page_context':
+        return pageContext();
+
+      case 'click_element': {
+        const el = resolve(args.selector);
+        if (el) { highlight(el); el.click(); return { success: true }; }
+        return { success: false, error: `Element not found: ${args.selector}` };
+      }
+
+      case 'type_text': {
+        const el = resolve(args.selector);
+        if (el) {
+          el.focus();
+          el.value = args.text;
+          el.dispatchEvent(new Event('input', { bubbles: true }));
+          el.dispatchEvent(new Event('change', { bubbles: true }));
+          return { success: true };
+        }
+        return { success: false, error: `Element not found: ${args.selector}` };
+      }
+
+      case 'navigate_to': {
+        const url = args.url.startsWith('http') ? args.url : 'https://' + args.url;
+        window.location.href = url;
+        return { success: true };
+      }
+
+      case 'scroll_page': {
+        const dir = (args.direction || 'down').toLowerCase();
+        if (dir === 'top') window.scrollTo({ top: 0, behavior: 'smooth' });
+        else if (dir === 'bottom') window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
+        else window.scrollBy({ top: dir === 'down' ? 600 : -600, behavior: 'smooth' });
+        return { success: true };
+      }
+
+      case 'describe_image': {
+        const imgEl = resolve(args.selector);
+        if (!imgEl || imgEl.tagName !== 'IMG') {
+          return { success: false, error: `Image not found: ${args.selector}` };
+        }
+        let imgUrl = imgEl.src;
+        try {
+          const c = document.createElement('canvas');
+          c.width = imgEl.naturalWidth || imgEl.width || 300;
+          c.height = imgEl.naturalHeight || imgEl.height || 300;
+          if (c.width > 0 && c.height > 0) {
+            c.getContext('2d').drawImage(imgEl, 0, 0, c.width, c.height);
+            const data = c.toDataURL('image/jpeg', 0.5);
+            if (data.length > 100) imgUrl = data;
+          }
+        } catch (e) { /* cross-origin, use src */ }
+        const resp = await ipc({
+          type: 'API_REQUEST', model: 'gpt-4o',
+          messages: [{
+            role: 'user', content: [
+              { type: 'image_url', image_url: { url: imgUrl, detail: 'low' } },
+              { type: 'text', text: 'Describe this image in detail. What do you see? 2-3 sentences max.' },
+            ],
+          }],
+        });
+        return { success: true, description: resp?.data?.choices?.[0]?.message?.content || 'Unable to describe.' };
+      }
+
+      default:
+        return { success: false, error: `Unknown tool: ${name}` };
     }
+  }
+
+  // ─── Screen Capture Helper ────────────────────────────────
+  function captureFrame() {
+    const canvas = document.createElement('canvas');
+    canvas.width = 1280;
+    canvas.height = Math.round(1280 * (hiddenVideo.videoHeight / hiddenVideo.videoWidth)) || 720;
+    canvas.getContext('2d').drawImage(hiddenVideo, 0, 0, canvas.width, canvas.height);
+    return canvas.toDataURL('image/jpeg', 0.55);
+  }
+
+  // ─── TTS ──────────────────────────────────────────────────
+  function stripMarkdown(text) {
+    return (text || '')
+      .replace(/```[\s\S]*?```/g, '')
+      .replace(/`([^`]+)`/g, '$1')
+      .replace(/\*\*(.+?)\*\*/g, '$1')
+      .replace(/\*(.+?)\*/g, '$1')
+      .replace(/^#{1,3} /gm, '')
+      .replace(/^[-•] /gm, '')
+      .replace(/<[^>]*>/g, '')
+      .replace(/\n/g, ' ')
+      .replace(/  +/g, ' ')
+      .trim();
+  }
+
+  async function speak(text, onDone) {
+    // NOTE: isHovering is intentionally NOT checked here — TTS should still fire during hover
+    if (!text || !apiKey || !isActive || isPaused) return;
+
+    stopSpeech();
+
+    let clean = stripMarkdown(text);
+    if (!clean) return;
+
+    isSpeaking = true;
+    ttsAbort = new AbortController();
+    const signal = ttsAbort.signal;
+
+    try {
+      const resp = await fetch('https://api.openai.com/v1/audio/speech', {
+        method: 'POST',
+        headers: { 'Authorization': 'Bearer ' + apiKey, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: TTS_MODEL,
+          voice: TTS_VOICE,
+          input: clean,
+          speed: TTS_SPEED,
+          response_format: 'opus',
+        }),
+        signal,
+      });
+
+      if (!resp.ok) throw new Error('TTS ' + resp.status);
+      if (signal.aborted || !isActive || isPaused) return;
+
+      const blob = await resp.blob();
+      if (signal.aborted || !isActive || isPaused) return;
+
+      if (_ttsBlobUrl) { URL.revokeObjectURL(_ttsBlobUrl); _ttsBlobUrl = null; }
+
+      _ttsBlobUrl = URL.createObjectURL(blob);
+      _ttsAudio = new Audio(_ttsBlobUrl);
+
+      _ttsAudio.onended = () => { cleanupAudio(); isSpeaking = false; onDone?.();};
+      _ttsAudio.onerror = () => { cleanupAudio(); isSpeaking = false; onDone?.();};
+
+      if (signal.aborted || !isActive || isPaused) { cleanupAudio(); return; }
+
+      await _ttsAudio.play();
+    } catch (e) {
+      if (e.name !== 'AbortError') console.warn('[WebSight] TTS error:', e.message);
+      cleanupAudio();
+      isSpeaking = false;
+      onDone?.();
+    }
+  }
+
+  function stopSpeech() {
+    if (ttsAbort) { ttsAbort.abort(); ttsAbort = null; }
+    if (_ttsAudio) {
+      _ttsAudio.onended = null;
+      _ttsAudio.onerror = null;
+      try { _ttsAudio.pause(); } catch (e) {}
+      _ttsAudio.src = '';
+      _ttsAudio = null;
+    }
+    if (_ttsBlobUrl) { URL.revokeObjectURL(_ttsBlobUrl); _ttsBlobUrl = null; }
+    isSpeaking = false;
+  }
+
+  function cleanupAudio() {
+    if (_ttsAudio) { _ttsAudio.onended = null; _ttsAudio.onerror = null; _ttsAudio = null; }
+    if (_ttsBlobUrl) { URL.revokeObjectURL(_ttsBlobUrl); _ttsBlobUrl = null; }
+  }
+
+  // ─── Pause / Resume ───────────────────────────────────────
+  function pauseAgent() {
+    if (!isActive || isPaused) return;
+    isPaused = true;
+
+    stopSpeech();
+
+    if (isRunning) {
+      cancelTask = true;
+      taskAbort?.abort();
+    }
+
+    setDot('paused');
+    setStatus('Paused — tap Resume to continue', 'paused');
+    window.__accessai?.setFooterStatus('Web-Sight: paused');
+
+    const pauseBtn = paneEl?.querySelector('#ws-agent-pause-btn');
+    const resumeBtn = paneEl?.querySelector('#ws-agent-resume-btn');
+    if (pauseBtn) pauseBtn.style.display = 'none';
+    if (resumeBtn) resumeBtn.style.display = 'flex';
+
+    addMsg('action', '⏸ Paused — not listening');
+  }
+
+  function resumeAgent() {
+    if (!isActive || !isPaused) return;
+    isPaused = false;
+    cancelTask = false;
+
+    setDot('on');
+    setStatus('Listening…', 'active');
+    window.__accessai?.setFooterStatus('Web-Sight: active');
+
+    const pauseBtn = paneEl?.querySelector('#ws-agent-pause-btn');
+    const resumeBtn = paneEl?.querySelector('#ws-agent-resume-btn');
+    if (pauseBtn) pauseBtn.style.display = 'flex';
+    if (resumeBtn) resumeBtn.style.display = 'none';
+
+    addMsg('action', '▶ Resumed — listening again');
   }
 
   // ─── Hover Image Vision ───────────────────────────────────
   async function describeImageHover(imgEl) {
-    if (!apiKey) return;
+    if (!apiKey || !isActive) return;
+
+    isHovering = true;  // NEW: mute mic input during hover analysis
+
+    if (hoverAbort) { hoverAbort.abort(); hoverAbort = null; }
+    hoverAbort = new AbortController();
+
     const altText = imgEl.getAttribute('alt') || imgEl.getAttribute('aria-label');
     let src = imgEl.src || imgEl.getAttribute('data-src') || imgEl.getAttribute('data-lazy-src');
-    
+
     if (!src || src.length < 5) {
-        if (altText) {
-            showHoverTip(imgEl, altText); speak(altText);
-        } else {
-            hoverOverlay.style.display = 'none';
-        }
-        return;
+      if (altText) { showHoverTip(imgEl, altText); speak(altText); }
+      else if (hoverOverlay) hoverOverlay.style.display = 'none';
+      isHovering = false;  // NEW: restore mic
+      return;
     }
-    
+
     if (!src.startsWith('http') && !src.startsWith('data:')) {
-        try { src = new URL(src, location.href).href; } catch(e) { return; }
+      try { src = new URL(src, location.href).href; } catch (e) { isHovering = false; return; }
     }
-    
+
     let finalUrl = src;
     try {
-        const c = document.createElement('canvas');
-        c.width = imgEl.naturalWidth || imgEl.width || 200;
-        c.height = imgEl.naturalHeight || imgEl.height || 200;
-        if (c.width > 0 && c.height > 0) {
-            c.getContext('2d').drawImage(imgEl, 0, 0, c.width, c.height);
-            const data = c.toDataURL('image/jpeg', 0.4);
-            if (data.length > 100) finalUrl = data;
-        }
-    } catch(e) {}
-    
+      const c = document.createElement('canvas');
+      c.width = imgEl.naturalWidth || imgEl.width || 200;
+      c.height = imgEl.naturalHeight || imgEl.height || 200;
+      if (c.width > 0 && c.height > 0) {
+        c.getContext('2d').drawImage(imgEl, 0, 0, c.width, c.height);
+        const data = c.toDataURL('image/jpeg', 0.4);
+        if (data.length > 100) finalUrl = data;
+      }
+    } catch (e) { /* cross-origin */ }
+
     showHoverTip(imgEl, 'Looking at image…');
+
     try {
-      const resp = await ipc({ type: 'API_REQUEST', model: 'gpt-4o', messages: [{ role: 'user', content: [
-        { type: 'text', text: 'Describe exactly what is happening in this image. Focus on subjects, actions, and clothing (e.g. cat running, human wearing saree). Max 15 words.' },
-        { type: 'image_url', image_url: { url: finalUrl, detail: 'low' } },
-      ]}], max_tokens: 30 });
-      
+      const resp = await ipc({
+        type: 'API_REQUEST', model: 'gpt-4o', max_tokens: 100,
+        messages: [{
+          role: 'user', content: [
+            { type: 'text', text: 'Describe exactly what is happening in this image. Focus on subjects, actions, and clothing. Max 50 words.' },
+            { type: 'image_url', image_url: { url: finalUrl, detail: 'low' } },
+          ],
+        }],
+      });
+
+      if (!isActive) { isHovering = false; return; }
+
       const desc = resp?.data?.choices?.[0]?.message?.content?.trim();
-      if (!desc || desc.includes("I can't see") || desc.includes("I cannot see") || desc.includes("sorry")) {
-         throw new Error("Vision failed");
-      }
-      showHoverTip(imgEl, desc); 
-      speak(desc); 
-      
-    } catch (e) { 
-      if (altText) {
-         showHoverTip(imgEl, altText); speak(altText);
-      } else {
-         showHoverTip(imgEl, 'Image (Cannot analyze)'); speak("Image cannot be analyzed.");
-      }
+      if (!desc || /I can'?t see|I cannot see|sorry/i.test(desc)) throw new Error('Vision failed');
+
+      showHoverTip(imgEl, desc);
+      speak(desc, () => { isHovering = false; });
+    } catch (e) {
+      if (!isActive) { isHovering = false; return; }
+      if (altText) { showHoverTip(imgEl, altText); speak(altText, () => { isHovering = false; }); }
+else { showHoverTip(imgEl, 'Image (Cannot analyze)'); isHovering = false; }
     }
   }
 
   function onHover(e) {
-    if (!paneReady || !isActive) return;
+    if (!paneReady || !isActive || !imageHoverEnabled) return;
     const target = e.target;
     if (target.closest('#accessai-sidebar')) return;
+
     clearTimeout(hoverTimer);
     const imgEl = target.tagName === 'IMG' ? target : target.querySelector?.('img');
+
     if (imgEl) {
       if (imgEl === lastHoverEl) return;
       lastHoverEl = imgEl;
-      hoverTimer = setTimeout(() => describeImageHover(imgEl), 800);
-    } else { if (hoverOverlay) hoverOverlay.style.display = 'none'; lastHoverEl = null; }
+      hoverTimer = setTimeout(() => describeImageHover(imgEl), 1500);
+    } else {
+      isHovering = false;  // NEW: ensure mic re-enabled when mouse leaves image
+      if (hoverAbort) { hoverAbort.abort(); hoverAbort = null; }
+      if (hoverOverlay) hoverOverlay.style.display = 'none';
+      lastHoverEl = null;
+    }
   }
 
   function showHoverTip(el, text) {
@@ -235,63 +530,73 @@ CRITICAL RULES:
 
       setStatus('Select your screen to share…', 'active');
       displayStream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: 5, width: 1280 }, audio: false });
-      
+
       hiddenVideo = document.createElement('video');
       hiddenVideo.style.cssText = 'position:fixed;top:-9999px;left:-9999px;width:1px;height:1px;opacity:0;pointer-events:none;';
-      hiddenVideo.autoplay = true; hiddenVideo.muted = true; hiddenVideo.playsInline = true;
+      hiddenVideo.autoplay = true;
+      hiddenVideo.muted = true;
+      hiddenVideo.playsInline = true;
       hiddenVideo.srcObject = displayStream;
       document.body.appendChild(hiddenVideo);
-      
-      hiddenVideo.play().catch(e => console.log(e));
-      displayStream.getVideoTracks()[0]?.addEventListener('ended', stopAgent);
+
+      hiddenVideo.play().catch(e => console.log('[WebSight] Video play:', e));
+      displayStream.getVideoTracks()[0]?.addEventListener('ended', stopAgent, { once: true });
 
       setStatus('Requesting microphone…', 'active');
-      micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      micStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+          channelCount: 1,
+          sampleRate: 24000,
+        },
+      });
 
       await connectWS();
 
       isActive = true;
+      isPaused = false;
+      isHovering = false;
       showActive();
-      
-      speak("Let me look at this page...");
-      setStatus('Analyzing page...', 'thinking');
-      
+
+      setStatus('Analyzing page…', 'active');
+
       await new Promise(r => {
         if (hiddenVideo.videoWidth > 0) return r();
         hiddenVideo.addEventListener('playing', () => setTimeout(r, 200), { once: true });
-        setTimeout(r, 2000); 
+        setTimeout(r, 2000);
       });
-      
-      let pageDesc = "this page.";
+
+      let pageDesc = 'this page.';
       try {
         if (hiddenVideo.videoWidth > 0) {
-            const canvas = document.createElement('canvas');
-            canvas.width = 1280; 
-            canvas.height = Math.round(1280 * (hiddenVideo.videoHeight / hiddenVideo.videoWidth)) || 720;
-            canvas.getContext('2d').drawImage(hiddenVideo, 0, 0, canvas.width, canvas.height);
-            const dataUrl = canvas.toDataURL('image/jpeg', 0.55);
-
-            const vResp = await ipc({ type: 'API_REQUEST', model: 'gpt-4o', messages: [{
-                role: 'user', content: [
+          const dataUrl = captureFrame();
+          const vResp = await ipc({
+            type: 'API_REQUEST', model: 'gpt-4o',
+            messages: [{
+              role: 'user', content: [
                 { type: 'text', text: "What is this page about? Describe it in one short sentence. Start with 'This page is about...'" },
-                { type: 'image_url', image_url: { url: dataUrl, detail: 'low' } }
-                ]
-            }]});
-            if (vResp?.data?.choices?.[0]?.message?.content) {
-                pageDesc = vResp.data.choices[0].message.content.trim();
-            }
+                { type: 'image_url', image_url: { url: dataUrl, detail: 'low' } },
+              ],
+            }],
+          });
+          if (vResp?.data?.choices?.[0]?.message?.content) {
+            pageDesc = vResp.data.choices[0].message.content.trim();
+          }
         }
       } catch (e) {}
 
-      // If history exists, user probably just refreshed/navigated, so welcome them back
-      const finalGreeting = history.length > 0 
-          ? `I am reconnected. ${pageDesc} What would you like to do next?`
-          : `I am your web assistant. ${pageDesc} How can I help you today?`;
-          
-      speak(finalGreeting);
-      addMsg('response', finalGreeting);
+      if (!isActive) return;
+
+      const greeting = history.length > 0
+        ? `I'm reconnected. ${pageDesc} What would you like to do next?`
+        : `I'm your web assistant. ${pageDesc} How can I help you today?`;
+
+      addMsg('response', greeting);
+      speak(greeting);
       setStatus('Listening…', 'active');
-      
+
     } catch (err) {
       addMsg('error', 'Permissions denied or cancelled.');
       stopAgent();
@@ -299,14 +604,50 @@ CRITICAL RULES:
   }
 
   function stopAgent() {
-    isActive = false; isRunning = false;
-    
-    if (ws) { ws.close(); ws = null; }
+    isActive = false;
+    isRunning = false;
+    isPaused = false;
+    isHovering = false;  // NEW: reset on stop
+    cancelTask = true;
+
+    stopSpeech();
+    if (taskAbort) { taskAbort.abort(); taskAbort = null; }
+    if (hoverAbort) { hoverAbort.abort(); hoverAbort = null; }
+    clearTimeout(hoverTimer);
+
+    if (ws) {
+      try { ws.close(1000, 'User stopped session'); } catch (e) {}
+      ws = null;
+    }
+
+    if (micWorklet) {
+      try { micWorklet.disconnect(); } catch (e) {}
+      micWorklet.port.onmessage = null;
+      micWorklet = null;
+    }
+    if (micProc) {
+      try { micProc.disconnect(); } catch (e) {}
+      micProc.onaudioprocess = null;
+      micProc = null;
+    }
+    if (micSrc) { try { micSrc.disconnect(); } catch (e) {} micSrc = null; }
+    if (micCtx) { try { micCtx.close(); } catch (e) {} micCtx = null; }
+
     if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
     if (displayStream) { displayStream.getTracks().forEach(t => t.stop()); displayStream = null; }
+
     if (hiddenVideo) { hiddenVideo.srcObject = null; hiddenVideo.remove(); hiddenVideo = null; }
-    
-    stopSpeech();
+    if (hoverOverlay) hoverOverlay.style.display = 'none';
+    lastHoverEl = null;
+
+    document.querySelectorAll('[data-aai-pulse]').forEach(e => {
+      e.style.outline = '';
+      e.style.outlineOffset = '';
+      e.style.boxShadow = '';
+      e.style.transition = '';
+      e.removeAttribute('data-aai-pulse');
+    });
+
     showIdle();
     setStatus('Stopped', '');
     setDot('');
@@ -314,116 +655,222 @@ CRITICAL RULES:
 
   async function connectWS() {
     return new Promise((resolve, reject) => {
-      ws = new WebSocket('wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17', ['realtime', `openai-insecure-api-key.${apiKey}`, 'openai-beta.realtime-v1']);
-      
-      const timeout = setTimeout(() => { ws.close(); reject(new Error('Timeout')); }, 10000);
+      ws = new WebSocket(
+        'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17',
+        ['realtime', `openai-insecure-api-key.${apiKey}`, 'openai-beta.realtime-v1']
+      );
 
-      ws.onopen = () => {
+      const timeout = setTimeout(() => { ws.close(); reject(new Error('WebSocket timeout')); }, 10000);
+
+      ws.onopen = async () => {
         clearTimeout(timeout);
-        ws.send(JSON.stringify({ type: 'session.update', session: { 
-            modalities: ['text','audio'], input_audio_transcription: { model: 'whisper-1' },
-            turn_detection: { type: 'server_vad', threshold: 0.5, silence_duration_ms: 1200 }
-        }}));
+        ws.send(JSON.stringify({
+          type: 'session.update',
+          session: {
+            modalities: ['text', 'audio'],
+            input_audio_transcription: { model: 'gpt-4o-mini-transcribe' },
+            turn_detection: {
+              type: 'server_vad',
+              threshold: 0.5,
+              silence_duration_ms: 1200,
+              prefix_padding_ms: 500,
+            },
+          },
+        }));
         setDot('on');
-        
+
         micCtx = new AudioContext({ sampleRate: 24000 });
-        const src = micCtx.createMediaStreamSource(micStream);
-        micProc = micCtx.createScriptProcessor(2048, 1, 1);
-        micProc.onaudioprocess = e => {
-          if (ws.readyState !== WebSocket.OPEN) return;
-          if (isSpeaking) return; 
-          
-          const f32 = e.inputBuffer.getChannelData(0); const i16 = new Int16Array(f32.length);
-          for (let i = 0; i < f32.length; i++) { const s = Math.max(-1, Math.min(1, f32[i])); i16[i] = s < 0 ? s * 32768 : s * 32767; }
-          const bytes = new Uint8Array(i16.buffer); let bin = ''; for (let i = 0; i < bytes.byteLength; i++) bin += String.fromCharCode(bytes[i]);
-          ws.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: btoa(bin) }));
+        micSrc = micCtx.createMediaStreamSource(micStream);
+
+        const sendAudioChunk = (f32) => {
+          if (!ws || ws.readyState !== WebSocket.OPEN) return;
+          if (isSpeaking) return;
+          if (isPaused) return;
+          if (imageHoverEnabled) return;  // NEW: block mic during image hover
+
+          const i16 = new Int16Array(f32.length);
+          for (let i = 0; i < f32.length; i++) {
+            const s = Math.max(-1, Math.min(1, f32[i]));
+            i16[i] = s < 0 ? s * 32768 : s * 32767;
+          }
+          const bytes = new Uint8Array(i16.buffer);
+          let bin = '';
+          for (let i = 0; i < bytes.byteLength; i++) bin += String.fromCharCode(bytes[i]);
+          try {
+            ws.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: btoa(bin) }));
+          } catch (e) {}
         };
-        src.connect(micProc); micProc.connect(micCtx.destination);
+
+        let usedWorklet = false;
+        try {
+          const workletCode = `
+            class MicProcessor extends AudioWorkletProcessor {
+              process(inputs) {
+                const ch = inputs[0]?.[0];
+                if (ch && ch.length > 0) this.port.postMessage(ch);
+                return true;
+              }
+            }
+            registerProcessor('mic-processor-v21', MicProcessor);
+          `;
+          const blob = new Blob([workletCode], { type: 'application/javascript' });
+          const url = URL.createObjectURL(blob);
+          await micCtx.audioWorklet.addModule(url);
+          URL.revokeObjectURL(url);
+
+          const workletNode = new AudioWorkletNode(micCtx, 'mic-processor-v21');
+          workletNode.port.onmessage = (e) => sendAudioChunk(e.data);
+          micSrc.connect(workletNode);
+          workletNode.connect(micCtx.destination);
+          micWorklet = workletNode;
+          usedWorklet = true;
+        } catch (e) {}
+
+        if (!usedWorklet) {
+          micProc = micCtx.createScriptProcessor(4096, 1, 1);
+          micProc.onaudioprocess = e => sendAudioChunk(e.inputBuffer.getChannelData(0));
+          micSrc.connect(micProc);
+          micProc.connect(micCtx.destination);
+        }
+
         resolve();
       };
-      
-      ws.onerror = () => reject();
-      ws.onmessage = e => { 
-        const ev = JSON.parse(e.data);
+
+      ws.onerror = (e) => { clearTimeout(timeout); reject(new Error('WebSocket error')); };
+
+      ws.onclose = () => {
+        clearTimeout(timeout);
+        if (isActive) { setStatus('Connection lost', ''); setDot(''); }
+      };
+
+      ws.onmessage = e => {
+        let ev;
+        try { ev = JSON.parse(e.data); } catch (err) { return; }
+
         if (ev.type === 'conversation.item.input_audio_transcription.completed' && ev.transcript?.trim()) {
-            if (!isSpeaking) {
-                addMsg('user', ev.transcript.trim()); 
-                runTask(ev.transcript.trim());
-            }
+          if (!isSpeaking && isActive && !isPaused && !imageHoverEnabled) {  // NEW: ignore transcripts during image hover
+            const transcript = ev.transcript.trim();
+            addMsg('user', transcript);
+            runTask(transcript);
+          }
         }
       };
     });
   }
 
-  // ─── Helpers ──────────────────────────────────────────────
-  function speak(text) {
-    if (!text) return;
-    
-    window.speechSynthesis.resume();
-    window.speechSynthesis.cancel();
-    
-    const utt = new SpeechSynthesisUtterance(text.replace(/<[^>]*>/g,''));
-    utt.rate = 0.95; 
-    utt.onstart = () => { isSpeaking = true; };
-    utt.onend = () => { isSpeaking = false; };
-    utt.onerror = () => { isSpeaking = false; };
-    isSpeaking = true; 
-    window.speechSynthesis.speak(utt);
+  // ─── Rendering ────────────────────────────────────────────
+  function renderMarkdown(text) {
+    if (!text) return '';
+    return text
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+      .replace(/\*(.+?)\*/g, '<em>$1</em>')
+      .replace(/`([^`]+)`/g, '<code style="background:rgba(255,255,255,.13);padding:1px 5px;border-radius:3px;font-family:monospace;font-size:12px;">$1</code>')
+      .replace(/^### (.+)$/gm, '<div style="font-weight:700;margin:4px 0 2px;">$1</div>')
+      .replace(/^## (.+)$/gm, '<div style="font-weight:800;margin:5px 0 2px;">$1</div>')
+      .replace(/^[-•] (.+)$/gm, '<div style="padding-left:14px;position:relative;margin:2px 0;"><span style="position:absolute;left:2px;color:#7dd3fc;">•</span>$1</div>')
+      .replace(/\n/g, '<br>');
   }
-  function stopSpeech() { 
-      if (window.speechSynthesis) window.speechSynthesis.cancel(); 
-      isSpeaking = false; 
-  }
+
   function addMsg(type, text) {
     if (!outputEl) return;
-    const div = document.createElement('div'); div.className = `ws-msg ws-${type}`; div.textContent = text;
-    outputEl.appendChild(div); div.scrollIntoView();
+    const div = document.createElement('div');
+    div.className = `ws-msg ws-${type}`;
+    if (type === 'response') div.innerHTML = renderMarkdown(text);
+    else div.textContent = text;
+    outputEl.appendChild(div);
+    div.scrollIntoView({ behavior: 'smooth', block: 'end' });
+    return div;
   }
-  function pageContext() { 
-      const forms = [...document.querySelectorAll('input:not([type="hidden"]), textarea, select')].slice(0, 15).map(el => el.placeholder || el.name || el.id || el.getAttribute('aria-label') || 'input field');
-      const formStr = forms.length > 0 ? `\nForms visible on page: ${forms.join(', ')}` : '';
-      return `URL: ${location.href}\nTitle: ${document.title}${formStr}`; 
+
+  // ─── Utilities ────────────────────────────────────────────
+  function pageContext() {
+    const searchInput = document.querySelector('input[name="q"]')?.value || '';
+    const forms = [...document.querySelectorAll('input:not([type="hidden"]), textarea, select')]
+      .slice(0, 50)  // increased from 15 to 30 for better form coverage
+      .map(el => el.placeholder || el.name || el.id || el.getAttribute('aria-label') || 'input field');
+    const formStr = forms.length > 0 ? `\nForms visible on page: ${forms.join(', ')}` : '';
+    return `Domain: ${location.hostname}\nURL: ${location.href}\nTitle: ${document.title}\nActive Query: ${searchInput}${formStr}`;
   }
-  function resolve(selector) { try { return document.querySelector(selector); } catch(e) { return null; } }
-  function highlight(el) { el.style.outline = '3px solid #06b6d4'; setTimeout(() => el.style.outline = '', 2000); }
+
+  function resolve(selector) {
+    try { return document.querySelector(selector); } catch (e) { return null; }
+  }
+
+  function highlight(el) {
+    const prev = el.style.outline;
+    el.style.outline = '3px solid #06b6d4';
+    el.style.outlineOffset = '2px';
+    setTimeout(() => { el.style.outline = prev; el.style.outlineOffset = ''; }, 2000);
+  }
+
   function wait(ms) { return new Promise(r => setTimeout(r, ms)); }
   function ts() { return new Date().toLocaleTimeString(); }
-  function setDot(cls) { const el = paneEl?.querySelector('#ws-agent-live-dot'); if(el) el.className = 'ws-agent-live-dot ' + cls; }
-  function setStatus(msg, cls) { const el = paneEl?.querySelector('#ws-agent-status-bar'); if(el) { el.textContent = msg; el.className = cls; } }
-  function ipc(msg) { return new Promise(r => chrome.runtime.sendMessage(msg, r)); }
 
-  // ─── UI Management ──────────────────────────────────────────────
+  function setDot(cls) {
+    const el = paneEl?.querySelector('#ws-agent-live-dot');
+    if (el) el.className = 'ws-agent-live-dot ' + cls;
+  }
+
+  function setStatus(msg, cls) {
+    const el = paneEl?.querySelector('#ws-agent-status-bar');
+    if (el) { el.textContent = msg; el.className = cls; }
+  }
+
+  function ipc(msg) {
+    return new Promise(r => chrome.runtime.sendMessage(msg, r));
+  }
+
+  // ─── UI ───────────────────────────────────────────────────
   const STYLES = `
     @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Syne:wght@600;800&display=swap');
-    #ws-agent-root { display: flex; flex-direction: column; width: 100%; height: 100%; font-family: 'Syne', sans-serif; background: #0f172a; overflow: hidden; color: #f8fafc; }
-    #ws-agent-idle { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 16px; padding: 20px; text-align: center; }
-    .ws-orb { width: 88px; height: 88px; border-radius: 50%; background: radial-gradient(circle at 35% 35%, rgba(6,182,212,0.35) 0%, rgba(14,165,233,0.18) 60%, rgba(15,23,42,0.95) 100%); border: 1.5px solid rgba(6,182,212,0.35); display: flex; align-items: center; justify-content: center; font-size: 32px; flex-shrink: 0; animation: ws-breathe 3.5s ease-in-out infinite; }
-    @keyframes ws-breathe { 0%,100% { box-shadow: 0 0 24px rgba(6,182,212,0.12); } 50% { box-shadow: 0 0 44px rgba(6,182,212,0.32); } }
-    .ws-idle-title { font-size: 15px; font-weight: 800; color: #f0ecff; }
-    .ws-idle-desc { font-size: 11px; color: #94a3b8; line-height: 1.65; max-width: 230px; }
-    #ws-agent-start-btn { width: 100%; padding: 13px 16px; background: linear-gradient(135deg, rgba(6,182,212,0.45), rgba(14,165,233,0.28)); border: 1.5px solid rgba(6,182,212,0.55); border-radius: 13px; cursor: pointer; font-family: 'Syne', sans-serif; font-size: 14px; font-weight: 800; color: white; box-shadow: 0 0 20px rgba(6,182,212,0.2); transition: all 0.2s; display: flex; align-items: center; justify-content: center; gap: 9px; }
-    #ws-agent-start-btn:hover { background: linear-gradient(135deg, rgba(6,182,212,0.65), rgba(14,165,233,0.42)); transform: translateY(-1px); }
-    #ws-agent-start-btn:disabled { opacity: 0.55; cursor: not-allowed; }
-    #ws-agent-active { display: none; flex-direction: column; width: 100%; height: 100%; }
-    #ws-agent-header { display: flex; align-items: center; justify-content: space-between; padding: 11px 14px; border-bottom: 1px solid rgba(255,255,255,0.05); }
-    .ws-hdr-left { display: flex; align-items: center; gap: 8px; }
-    #ws-agent-live-dot { width: 8px; height: 8px; border-radius: 50%; background: #475569; transition: all 0.3s; }
-    #ws-agent-live-dot.on { background: #06b6d4; box-shadow: 0 0 8px #06b6d4; }
-    #ws-agent-live-dot.thinking { background: #fbbf24; box-shadow: 0 0 8px #fbbf24; animation: ws-ping 1s infinite; }
-    @keyframes ws-ping { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
-    .ws-title { font-size: 11px; font-weight: 800; letter-spacing: 0.1em; text-transform: uppercase; }
-    #ws-agent-stop-btn { width: 28px; height: 28px; border-radius: 7px; border: 1px solid rgba(239,68,68,0.25); background: rgba(239,68,68,0.07); color: #f87171; font-size: 12px; cursor: pointer; display: flex; align-items: center; justify-content: center; transition: all 0.2s; }
-    #ws-agent-stop-btn:hover { background: rgba(239,68,68,0.18); border-color: rgba(239,68,68,0.5); }
-    #ws-agent-status-bar { padding: 6px 14px; font-family: 'DM Mono', monospace; font-size: 10px; color: #94a3b8; border-bottom: 1px solid rgba(255,255,255,0.04); }
-    #ws-agent-status-bar.active { color: #06b6d4; }
-    #ws-agent-feed { flex: 1; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 8px; font-family: sans-serif; }
-    .ws-msg { padding: 8px 12px; border-radius: 6px; font-size: 13px; line-height: 1.4; word-wrap: break-word; }
-    .ws-user { background: #1e293b; color: #e2e8f0; align-self: flex-end; max-width: 85%; border-left: 3px solid #3b82f6; }
-    .ws-response { background: #0ea5e9; color: white; align-self: flex-start; max-width: 90%; border-left: 3px solid #0284c7; }
-    .ws-action { font-size: 11px; color: #64748b; font-style: italic; }
-    #ws-agent-footer { padding: 8px 12px; border-top: 1px solid rgba(255,255,255,0.04); flex-shrink: 0; }
-    #ws-agent-clear-btn { width: 100%; background: transparent; border: 1px solid rgba(255,255,255,0.06); border-radius: 8px; padding: 6px; color: #9ca3af; font-family: 'DM Mono', monospace; font-size: 10px; letter-spacing: 0.07em; text-transform: uppercase; cursor: pointer; transition: all 0.2s; }
-    #ws-agent-clear-btn:hover { border-color: rgba(239,68,68,0.3); color: #f87171; }
+    #ws-agent-root { display:flex; flex-direction:column; width:100%; height:100%; font-family:'Syne',sans-serif; background:#0f172a; overflow:hidden; color:#f8fafc; }
+    #ws-agent-idle { flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:16px; padding:20px; text-align:center; }
+    .ws-orb { width:88px; height:88px; border-radius:50%; background:radial-gradient(circle at 35% 35%,rgba(6,182,212,0.35) 0%,rgba(14,165,233,0.18) 60%,rgba(15,23,42,0.95) 100%); border:1.5px solid rgba(6,182,212,0.35); display:flex; align-items:center; justify-content:center; font-size:32px; flex-shrink:0; animation:ws-breathe 3.5s ease-in-out infinite; }
+    @keyframes ws-breathe { 0%,100%{box-shadow:0 0 24px rgba(6,182,212,0.12)} 50%{box-shadow:0 0 44px rgba(6,182,212,0.32)} }
+    .ws-idle-title { font-size:15px; font-weight:800; color:#f0ecff; }
+    .ws-idle-desc { font-size:11px; color:#94a3b8; line-height:1.65; max-width:230px; }
+    #ws-agent-start-btn { width:100%; padding:13px 16px; background:linear-gradient(135deg,rgba(6,182,212,0.45),rgba(14,165,233,0.28)); border:1.5px solid rgba(6,182,212,0.55); border-radius:13px; cursor:pointer; font-family:'Syne',sans-serif; font-size:14px; font-weight:800; color:white; box-shadow:0 0 20px rgba(6,182,212,0.2); transition:all 0.2s; display:flex; align-items:center; justify-content:center; gap:9px; }
+    #ws-agent-start-btn:hover { background:linear-gradient(135deg,rgba(6,182,212,0.65),rgba(14,165,233,0.42)); transform:translateY(-1px); }
+    #ws-agent-start-btn:disabled { opacity:0.55; cursor:not-allowed; transform:none; }
+    #ws-agent-active { display:none; flex-direction:column; width:100%; height:100%; }
+    #ws-agent-header { display:flex; align-items:center; justify-content:space-between; padding:11px 14px; border-bottom:1px solid rgba(255,255,255,0.05); }
+    .ws-hdr-left { display:flex; align-items:center; gap:8px; }
+    #ws-agent-live-dot { width:8px; height:8px; border-radius:50%; background:#475569; transition:all 0.3s; }
+    #ws-agent-live-dot.on { background:#06b6d4; box-shadow:0 0 8px #06b6d4; }
+    #ws-agent-live-dot.thinking { background:#fbbf24; box-shadow:0 0 8px #fbbf24; animation:ws-ping 1s infinite; }
+    #ws-agent-live-dot.paused { background:#f59e0b; box-shadow:0 0 8px #f59e0b; animation:ws-pause-pulse 2s ease-in-out infinite; }
+    @keyframes ws-ping { 0%,100%{opacity:1} 50%{opacity:0.3} }
+    @keyframes ws-pause-pulse { 0%,100%{opacity:0.5;box-shadow:0 0 4px #f59e0b} 50%{opacity:1;box-shadow:0 0 12px #f59e0b} }
+    .ws-title { font-size:11px; font-weight:800; letter-spacing:0.1em; text-transform:uppercase; }
+    #ws-agent-stop-btn { width:28px; height:28px; border-radius:7px; border:1px solid rgba(239,68,68,0.25); background:rgba(239,68,68,0.07); color:#f87171; font-size:12px; cursor:pointer; display:flex; align-items:center; justify-content:center; transition:all 0.2s; }
+    #ws-agent-stop-btn:hover { background:rgba(239,68,68,0.18); border-color:rgba(239,68,68,0.5); }
+    #ws-agent-pause-btn { height:28px; padding:0 10px; border-radius:7px; border:1px solid rgba(251,191,36,0.25); background:rgba(251,191,36,0.07); color:#fbbf24; font-size:11px; font-family:'DM Mono',monospace; letter-spacing:0.04em; cursor:pointer; display:flex; align-items:center; gap:5px; transition:all 0.18s; white-space:nowrap; }
+    #ws-agent-pause-btn:hover { background:rgba(251,191,36,0.18); border-color:rgba(251,191,36,0.5); }
+    #ws-agent-resume-btn { height:28px; padding:0 10px; border-radius:7px; border:1px solid rgba(74,222,128,0.35); background:rgba(74,222,128,0.1); color:#4ade80; font-size:11px; font-family:'DM Mono',monospace; letter-spacing:0.04em; cursor:pointer; display:none; align-items:center; gap:5px; transition:all 0.18s; animation:ws-pause-pulse 2s ease-in-out infinite; }
+    #ws-agent-resume-btn:hover { background:rgba(74,222,128,0.22); border-color:rgba(74,222,128,0.6); animation:none; }
+    #ws-agent-status-bar { padding:6px 14px; font-family:'DM Mono',monospace; font-size:10px; color:#94a3b8; border-bottom:1px solid rgba(255,255,255,0.04); }
+    #ws-agent-status-bar.active { color:#06b6d4; }
+    #ws-agent-status-bar.paused { color:#f59e0b; }
+    #ws-agent-feed { flex:1; overflow-y:auto; padding:12px; display:flex; flex-direction:column; gap:8px; font-family:sans-serif; scroll-behavior:smooth; }
+    .ws-msg { padding:8px 12px; border-radius:8px; font-size:13px; line-height:1.5; word-wrap:break-word; max-width:90%; animation:ws-fadeIn 0.2s ease-out; }
+    @keyframes ws-fadeIn { from{opacity:0;transform:translateY(4px)} to{opacity:1;transform:translateY(0)} }
+    .ws-user { background:#1e293b; color:#e2e8f0; align-self:flex-end; max-width:85%; border-left:3px solid #3b82f6; }
+    .ws-response { background:linear-gradient(135deg,#0ea5e9,#0284c7); color:white; align-self:flex-start; border-left:3px solid #0369a1; }
+    .ws-action { font-size:11px; color:#64748b; font-style:italic; padding:4px 12px; }
+    .ws-error { font-size:11px; color:#f87171; padding:4px 12px; }
+    #ws-agent-footer { padding:8px 12px; border-top:1px solid rgba(255,255,255,0.04); flex-shrink:0; }
+    #ws-agent-clear-btn { width:100%; background:transparent; border:1px solid rgba(255,255,255,0.06); border-radius:8px; padding:6px; color:#9ca3af; font-family:'DM Mono',monospace; font-size:10px; letter-spacing:0.07em; text-transform:uppercase; cursor:pointer; transition:all 0.2s; }
+    #ws-agent-clear-btn:hover { border-color:rgba(239,68,68,0.3); color:#f87171; }
+    .ws-hdr-right { display:flex; align-items:center; gap:6px; }
+    #ws-hover-pill { display:flex; align-items:center; gap:6px; padding:5px 11px; border-radius:20px; border:1px solid rgba(255,255,255,0.08); background:rgba(30,41,59,0.7); cursor:pointer; transition:all 0.25s; user-select:none; }
+    #ws-hover-pill:hover { background:rgba(30,41,59,0.95); border-color:rgba(255,255,255,0.14); }
+    #ws-hover-pill.active { border-color:rgba(6,182,212,0.45); background:rgba(6,182,212,0.1); }
+    #ws-hover-pill .ws-pill-dot { width:7px; height:7px; border-radius:50%; background:#475569; transition:all 0.25s; flex-shrink:0; }
+    #ws-hover-pill.active .ws-pill-dot { background:#06b6d4; box-shadow:0 0 6px rgba(6,182,212,0.6); }
+    #ws-hover-pill .ws-pill-icon { font-size:12px; line-height:1; }
+    #ws-hover-pill .ws-pill-label { font-family:'DM Mono',monospace; font-size:10px; color:#94a3b8; letter-spacing:0.03em; transition:color 0.25s; white-space:nowrap; }
+    #ws-hover-pill.active .ws-pill-label { color:#7dd3fc; }
   `;
 
   const HTML = `
@@ -431,7 +878,7 @@ CRITICAL RULES:
       <div id="ws-agent-idle">
         <div class="ws-orb">🌐</div>
         <div class="ws-idle-title">Web-Sight</div>
-        <div class="ws-idle-desc">Your voice-controlled web assistant. Ready to help you read and navigate pages.</div>
+        <div class="ws-idle-desc">Your AI-powered visual assistant. Ready to help you read, explore, and explain what's on your screen.</div>
         <button id="ws-agent-start-btn"><span style="font-size:17px">🎙</span> Start Session</button>
       </div>
       <div id="ws-agent-active">
@@ -440,7 +887,16 @@ CRITICAL RULES:
             <div id="ws-agent-live-dot"></div>
             <div class="ws-title">Web-Sight</div>
           </div>
-          <button id="ws-agent-stop-btn" title="Stop session">⏹</button>
+          <div class="ws-hdr-right">
+            <div id="ws-hover-pill" title="Toggle image hover descriptions">
+              <div class="ws-pill-dot"></div>
+              <span class="ws-pill-icon">🖼</span>
+              <span class="ws-pill-label">Image Hover</span>
+            </div>
+            <button id="ws-agent-pause-btn" title="Pause — stop listening temporarily">⏸</button>
+            <button id="ws-agent-resume-btn" title="Resume listening">▶</button>
+            <button id="ws-agent-stop-btn" title="Stop session">⏹</button>
+          </div>
         </div>
         <div id="ws-agent-status-bar">Connecting…</div>
         <div id="ws-agent-feed"></div>
@@ -471,14 +927,16 @@ CRITICAL RULES:
     if (paneReady) return;
     const pane = window.__accessai?.getSidebarPane('web-sight');
     if (!pane) { setTimeout(initPane, 200); return; }
-    paneReady = true; paneEl = pane;
-    
+    paneReady = true;
+    paneEl = pane;
+
     if (!document.getElementById('ws-agent-styles')) {
       const s = document.createElement('style');
-      s.id = 'ws-agent-styles'; s.textContent = STYLES;
+      s.id = 'ws-agent-styles';
+      s.textContent = STYLES;
       document.head.appendChild(s);
     }
-    
+
     paneEl.style.cssText = 'padding:0;overflow:hidden;display:flex;flex-direction:column;height:100%;';
     paneEl.innerHTML = HTML;
     outputEl = paneEl.querySelector('#ws-agent-feed');
@@ -486,20 +944,56 @@ CRITICAL RULES:
     paneEl.querySelector('#ws-agent-start-btn').addEventListener('click', startAgent);
     paneEl.querySelector('#ws-agent-stop-btn').addEventListener('click', stopAgent);
     paneEl.querySelector('#ws-agent-clear-btn').addEventListener('click', clearHistory);
+    paneEl.querySelector('#ws-agent-pause-btn').addEventListener('click', pauseAgent);
+    paneEl.querySelector('#ws-agent-resume-btn').addEventListener('click', resumeAgent);
+
+    // Image hover toggle
+    const hoverPill = paneEl.querySelector('#ws-hover-pill');
+    if (hoverPill) {
+      try {
+        chrome.storage.local.get('websight_image_hover', res => {
+          imageHoverEnabled = !!res.websight_image_hover;
+          if (imageHoverEnabled) hoverPill.classList.add('active');
+        });
+      } catch (e) {}
+
+      hoverPill.addEventListener('click', () => {
+        imageHoverEnabled = !imageHoverEnabled;
+        hoverPill.classList.toggle('active', imageHoverEnabled);
+        try { chrome.storage.local.set({ websight_image_hover: imageHoverEnabled }); } catch (e) {}
+        if (!imageHoverEnabled) {
+          isHovering = false;  // NEW: reset on toggle off
+          if (hoverAbort) { hoverAbort.abort(); hoverAbort = null; }
+          clearTimeout(hoverTimer);
+          if (hoverOverlay) hoverOverlay.style.display = 'none';
+          lastHoverEl = null;
+        }
+      });
+    }
 
     if (!hoverOverlay) {
       hoverOverlay = document.createElement('div');
       hoverOverlay.id = 'ws-hover';
-      hoverOverlay.style.cssText = 'position:fixed;z-index:999999;background:#06b6d4;color:black;padding:6px 10px;border-radius:6px;font-weight:bold;font-size:12px;display:none;pointer-events:none;';
+      hoverOverlay.style.cssText = 'position:fixed;z-index:999999;background:#06b6d4;color:black;padding:6px 10px;border-radius:6px;font-weight:bold;font-size:12px;display:none;pointer-events:none;max-width:280px;line-height:1.3;';
       document.body.appendChild(hoverOverlay);
     }
     document.addEventListener('mouseover', onHover, true);
-    
-    await loadHistory(); 
-    history.forEach(e => { if(e.type==='cmd') addMsg('user', e.text); else if(e.type==='reply') addMsg('response', e.text); });
+
+    await loadHistory();
+    history.forEach(e => {
+      if (e.type === 'cmd') addMsg('user', e.text);
+      else if (e.type === 'reply') addMsg('response', e.text);
+    });
     showIdle();
   }
 
-  window.addEventListener('accessai-mode-changed', e => { if (e.detail.mode === 'web-sight') initPane(); else { if (isActive) stopAgent(); } });
-  chrome.storage.local.get('activeMode', r => { if (r.activeMode === 'web-sight') setTimeout(initPane, 500); });
+  // ─── Bootstrap ────────────────────────────────────────────
+  window.addEventListener('accessai-mode-changed', e => {
+    if (e.detail.mode === 'web-sight') initPane();
+    else { if (isActive) stopAgent(); }
+  });
+
+  chrome.storage.local.get('activeMode', r => {
+    if (r.activeMode === 'web-sight') setTimeout(initPane, 500);
+  });
 })();

@@ -2,21 +2,23 @@
 const OPENAI_API_KEY = '';
 
 let activeMode = null;
+const injectedTabs = new Set(); // FIX #6: Track injected tabs
 
-// ─── On install: inject scripts into all existing tabs ──────
+// ─── On install ─────────────────────────────────────────────
 chrome.runtime.onInstalled.addListener(() => {
   chrome.storage.local.set({ activeMode: null });
+  injectedTabs.clear();
   injectIntoAllTabs();
 });
 
-// ─── On Chrome startup: clear session data, auto-open sidebar ──
 chrome.runtime.onStartup.addListener(() => {
   chrome.storage.local.remove('websight_conversation_history');
   chrome.storage.local.set({ sidebarOpen: true, activeMode: 'web-sight' });
   activeMode = 'web-sight';
+  injectedTabs.clear();
 });
 
-// ─── Inject scripts into all eligible tabs ──────────────────
+// ─── Inject scripts ─────────────────────────────────────────
 function injectIntoAllTabs() {
   chrome.tabs.query({ url: ['https://*/*', 'http://*/*'] }, (tabs) => {
     if (chrome.runtime.lastError) return;
@@ -28,50 +30,61 @@ function injectIntoAllTabs() {
 }
 
 function injectScripts(tabId) {
+  // FIX #6: Guard against double-injection
+  if (injectedTabs.has(tabId)) return;
+  injectedTabs.add(tabId);
+
   chrome.scripting.insertCSS({ target: { tabId }, files: ['styles/sidebar.css'] }).catch(() => {});
   chrome.scripting.executeScript({ target: { tabId }, files: [
     'content-scripts/sidebar.js',
     'content-scripts/social-cue.js',
     'content-scripts/web-sight.js',
     'content-scripts/clear-context.js'
-  ] }).catch(() => {});
+  ] }).catch(() => {
+    injectedTabs.delete(tabId); // Allow retry on failure
+  });
 }
+
+// FIX #6: Clean up tracking when tabs close or navigate
+chrome.tabs.onRemoved.addListener((tabId) => {
+  injectedTabs.delete(tabId);
+  websightActiveTabs.delete(tabId);
+});
 
 // ─── Message handling ────────────────────────────────────────
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   const handlers = {
-  'SET_MODE':              handleSetMode,
-  'GET_MODE':              handleGetMode,
-  'API_REQUEST':           handleApiRequest,
-  'API_REALTIME_SESSION':  handleRealtimeSession,
-  'TTS_SPEAK':             handleTtsSpeak,
-  'EXECUTE_DOM_ACTION':    handleDomAction,
-  'TOGGLE_SIDEBAR':        handleToggleSidebar,
-  'GET_API_KEY':           handleGetApiKey,
-  'WEBSIGHT_ACTIVE_STATE': handleWebSightState,
-  'WEBSIGHT_NAVIGATE':     handleWebSightNavigate,
-  'WEBSIGHT_OPEN_TAB':     handleWebSightOpenTab,
-  'WEBSIGHT_CLOSE_TAB':    handleWebSightCloseTab,
-  'WEBSIGHT_SWITCH_TAB':   handleWebSightSwitchTab,
-  'WEBSIGHT_CAPTURE_VISIBLE_TAB': handleCaptureVisibleTab // <-- The new handler for screenshots
-};
+    'SET_MODE':              handleSetMode,
+    'GET_MODE':              handleGetMode,
+    'API_REQUEST':           handleApiRequest,
+    'API_REALTIME_SESSION':  handleRealtimeSession,
+    'TTS_SPEAK':             handleTtsSpeak,
+    'EXECUTE_DOM_ACTION':    handleDomAction,
+    'TOGGLE_SIDEBAR':        handleToggleSidebar,
+    'GET_API_KEY':           handleGetApiKey,
+    'WEBSIGHT_ACTIVE_STATE': handleWebSightState,
+    'WEBSIGHT_NAVIGATE':     handleWebSightNavigate,
+    'WEBSIGHT_OPEN_TAB':     handleWebSightOpenTab,
+    'WEBSIGHT_CLOSE_TAB':    handleWebSightCloseTab,
+    'WEBSIGHT_SWITCH_TAB':   handleWebSightSwitchTab,
+    'WEBSIGHT_CAPTURE_VISIBLE_TAB': handleCaptureVisibleTab,
+  };
   const handler = handlers[message.type];
   if (handler) {
     handler(message, sender, sendResponse);
-    return true; // keep channel open for async
+    return true;
   }
 });
 
-// ─── NEW: Screenshot handler ──────────────────────────────────
+// ─── Handlers ────────────────────────────────────────────────
 function handleCaptureVisibleTab(message, sender, sendResponse) {
   chrome.tabs.captureVisibleTab(null, { format: 'jpeg', quality: 40 }, (dataUrl) => {
     if (chrome.runtime.lastError) {
       sendResponse({ success: false, error: chrome.runtime.lastError.message });
     } else {
-      sendResponse({ success: true, dataUrl: dataUrl });
+      sendResponse({ success: true, dataUrl });
     }
   });
-  return true; 
 }
 
 function handleGetApiKey(m, s, sr) { sr({ key: OPENAI_API_KEY }); }
@@ -91,10 +104,17 @@ function handleSetMode(m, s, sr) {
 function handleGetMode(m, s, sr) { sr({ mode: activeMode }); }
 
 async function handleApiRequest(message, sender, sendResponse) {
+  // FIX #2: Guard against empty API key
+  if (!OPENAI_API_KEY) {
+    sendResponse({ success: false, error: 'API key not configured. Add it to background.js.' });
+    return;
+  }
+
   try {
     const body = {
       model: message.model || 'gpt-4o',
       messages: message.messages,
+      // FIX #1: Propagate max_tokens from message
       max_tokens: message.max_tokens || 300,
       temperature: message.temperature !== undefined ? message.temperature : 0.3,
     };
@@ -119,30 +139,54 @@ async function handleApiRequest(message, sender, sendResponse) {
 }
 
 async function handleRealtimeSession(message, sender, sendResponse) {
+  // FIX #2: Don't return success with empty API key
+  if (!OPENAI_API_KEY) {
+    sendResponse({ success: false, error: 'API key not configured.' });
+    return;
+  }
   sendResponse({ success: true, apiKey: OPENAI_API_KEY, model: 'gpt-4o-realtime-preview' });
 }
 
+// FIX #3 + #4: Add timeout to prevent hanging, handle 'cancelled' event
 function handleTtsSpeak(message, sender, sendResponse) {
+  let responded = false;
+  const timeout = setTimeout(() => {
+    if (!responded) { responded = true; sendResponse({ success: false, error: 'TTS timeout' }); }
+  }, 15000);
+
   chrome.tts.speak(message.text, {
     rate: message.rate || 0.9,
     pitch: message.pitch || 0.8,
     volume: message.volume || 0.4,
     lang: 'en-US',
     onEvent: (event) => {
-      if (event.type === 'end' || event.type === 'error') {
+      if (responded) return;
+      if (event.type === 'end' || event.type === 'error' || event.type === 'cancelled') {
+        responded = true;
+        clearTimeout(timeout);
         sendResponse({ success: event.type === 'end' });
       }
     },
   });
 }
 
+// FIX #5 + #7: Use sender.tab.id, check lastError
 function handleDomAction(message, sender, sendResponse) {
-  chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-    if (chrome.runtime.lastError || !tabs[0]) { sendResponse({ success: false }); return; }
-    chrome.tabs.sendMessage(tabs[0].id, { type: 'PERFORM_DOM_ACTION', action: message.action }, (r) => {
+  const tabId = sender.tab?.id;
+  if (tabId) {
+    chrome.tabs.sendMessage(tabId, { type: 'PERFORM_DOM_ACTION', action: message.action }, (r) => {
+      if (chrome.runtime.lastError) { sendResponse({ success: false }); return; }
       sendResponse(r || { success: false });
     });
-  });
+  } else {
+    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+      if (chrome.runtime.lastError || !tabs[0]) { sendResponse({ success: false }); return; }
+      chrome.tabs.sendMessage(tabs[0].id, { type: 'PERFORM_DOM_ACTION', action: message.action }, (r) => {
+        if (chrome.runtime.lastError) { sendResponse({ success: false }); return; }
+        sendResponse(r || { success: false });
+      });
+    });
+  }
 }
 
 function handleToggleSidebar(message, sender, sendResponse) {
@@ -150,7 +194,7 @@ function handleToggleSidebar(message, sender, sendResponse) {
     if (chrome.runtime.lastError || !tabs[0]) { sendResponse({ success: false }); return; }
     chrome.tabs.sendMessage(tabs[0].id, { type: 'TOGGLE_SIDEBAR' }, (r) => {
       if (chrome.runtime.lastError) {
-        // Scripts not loaded yet, inject them
+        injectedTabs.delete(tabs[0].id);
         injectScripts(tabs[0].id);
         setTimeout(() => {
           chrome.tabs.sendMessage(tabs[0].id, { type: 'TOGGLE_SIDEBAR' }).catch(() => {});
@@ -166,11 +210,8 @@ const websightActiveTabs = new Set();
 function handleWebSightState(message, sender, sendResponse) {
   const tabId = sender.tab?.id;
   if (!tabId) { sendResponse({ success: false }); return; }
-  if (message.active) {
-    websightActiveTabs.add(tabId);
-  } else {
-    websightActiveTabs.delete(tabId);
-  }
+  if (message.active) websightActiveTabs.add(tabId);
+  else websightActiveTabs.delete(tabId);
   sendResponse({ success: true });
 }
 
@@ -220,6 +261,7 @@ chrome.action.onClicked.addListener((tab) => {
   chrome.tabs.sendMessage(tab.id, { type: 'TOGGLE_SIDEBAR' }, () => {
     const err = chrome.runtime.lastError?.message || '';
     if (err.includes('Could not establish connection') || err.includes('Receiving end does not exist')) {
+      injectedTabs.delete(tab.id);
       injectScripts(tab.id);
       setTimeout(() => {
         chrome.tabs.sendMessage(tab.id, { type: 'TOGGLE_SIDEBAR' }).catch(() => {});
@@ -228,9 +270,12 @@ chrome.action.onClicked.addListener((tab) => {
   });
 });
 
+// FIX #38: Clear injection tracking on navigation so scripts re-inject properly
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (changeInfo.status !== 'complete') return;
   if (!tab.url || tab.url.startsWith('chrome') || tab.url.startsWith('about') || tab.url.startsWith('edge')) return;
+
+  injectedTabs.delete(tabId); // Page navigated — need fresh injection
 
   chrome.storage.local.get(['sidebarOpen', 'activeMode'], (result) => {
     if (chrome.runtime.lastError) return;
