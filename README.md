@@ -4,6 +4,12 @@ An AI-powered Chrome extension providing three real-time intelligent tools built
 
 ---
 
+## Live Demo
+
+Watch a short [Demo](https://youtu.be/riL_kUa2YCA) on YouTube.
+
+---
+
 # AccessAI — Quick Setup
 
 > **You will need an OpenAI API key** to use this extension. Get one at [platform.openai.com/api-keys](https://platform.openai.com/api-keys). Your key needs access to GPT-4o, Whisper, and TTS.
